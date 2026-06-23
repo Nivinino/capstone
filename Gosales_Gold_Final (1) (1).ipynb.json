@@ -1,0 +1,2480 @@
+{
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {},
+     "inputWidgets": {},
+     "nuid": "2504bf22-f20c-450b-afc8-8911d8de5d6e",
+     "showTitle": true,
+     "tableResultSettingsMap": {},
+     "title": "Gold Layer Overview"
+    }
+   },
+   "source": [
+    "# Go Sales Data Pipeline - Gold Layer (Star Schema)\n",
+    "\n",
+    "This notebook builds the analytical gold layer with a star schema design for reporting and BI.\n",
+    "\n",
+    "**Data Source:** Silver Delta tables (cleaned from ADLS `datalakedegroup3/gosales/raw/`)\n",
+    "\n",
+    "**Objectives:**\n",
+    "* Build Star Schema (dimensions + fact table)\n",
+    "* Create Dimension Tables (Product, Retailer, Order Method, Date)\n",
+    "* Create Fact Table (fact_sales with surrogate keys)\n",
+    "* Calculate Business KPIs (revenue, discount, quantity)\n",
+    "* Build Aggregated Reporting Tables (by product, country, year)\n",
+    "* Implement Data Quality Gates (pre-load validation)\n",
+    "* Apply Row-Level Security and Column Masking\n",
+    "\n",
+    "**Output Tables:**\n",
+    "* `gold_dim_product`, `gold_dim_retailer`, `gold_dim_order_method`, `gold_dim_date`\n",
+    "* `gold_fact_sales`\n",
+    "* `gold_sales_kpi`, `gold_product_sales`, `gold_country_sales`, `gold_yearly_sales`, `gold_top_products`"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 0,
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "finishTime": 1782210838513,
+     "inputWidgets": {},
+     "nuid": "e04847ae-3e3e-4cba-8b67-b0647a9380d6",
+     "showTitle": true,
+     "startTime": 1782210838464,
+     "submitTime": 1782210837939,
+     "tableResultSettingsMap": {},
+     "title": "Setup & ADLS Config"
+    }
+   },
+   "outputs": [
+    {
+     "output_type": "stream",
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Schema: default\n"
+     ]
+    }
+   ],
+   "source": [
+    "from pyspark.sql.functions import *\n",
+    "from pyspark.sql.window import Window\n",
+    "\n",
+    "schema = \"default\"\n",
+    "\n",
+    "# Gold layer reads from Silver Delta tables (Hive metastore, no Unity Catalog)\n",
+    "# ADLS access is only needed in the Bronze notebook for raw file ingestion\n",
+    "print(f\"Schema: {schema}\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {},
+     "inputWidgets": {},
+     "nuid": "2cafc9fc-f0ae-4d70-90bb-f4e1ac37c26c",
+     "showTitle": true,
+     "tableResultSettingsMap": {},
+     "title": "Read Silver Tables"
+    }
+   },
+   "source": [
+    "## 1. Read Silver Tables\n",
+    "\n",
+    "Load all four silver tables as source DataFrames for gold layer transformations."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 0,
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "finishTime": 1782210845627,
+     "inputWidgets": {},
+     "nuid": "a1db765d-319c-43ad-b92c-4b277720fa20",
+     "showTitle": true,
+     "startTime": 1782210844980,
+     "submitTime": 1782210844563,
+     "tableResultSettingsMap": {},
+     "title": "Read Silver Tables"
+    }
+   },
+   "outputs": [],
+   "source": [
+    "products_df = spark.table(\n",
+    "    f\"{schema}.silver_products\"\n",
+    ")\n",
+    "\n",
+    "retailers_df = spark.table(\n",
+    "    f\"{schema}.silver_retailers\"\n",
+    ")\n",
+    "\n",
+    "methods_df = spark.table(\n",
+    "    f\"{schema}.silver_order_methods\"\n",
+    ")\n",
+    "\n",
+    "sales_df = spark.table(\n",
+    "    f\"{schema}.silver_daily_sales\"\n",
+    ")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {},
+     "inputWidgets": {},
+     "nuid": "20a2cd64-e85b-4dce-97d9-dee6bc8035d1",
+     "showTitle": true,
+     "tableResultSettingsMap": {},
+     "title": "Data Quality Gate"
+    }
+   },
+   "source": [
+    "## 2. Data Quality Gate\n",
+    "\n",
+    "Validate critical columns before proceeding with gold layer build. Pipeline stops if null checks fail on primary keys."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 0,
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "finishTime": 1782210848831,
+     "inputWidgets": {},
+     "nuid": "7b630b21-94a0-4442-868a-87a538f8a539",
+     "showTitle": false,
+     "startTime": 1782210847885,
+     "submitTime": 1782210847409,
+     "tableResultSettingsMap": {},
+     "title": ""
+    }
+   },
+   "outputs": [],
+   "source": [
+    "critical_checks = {\n",
+    "\n",
+    "    \"products_nulls\":\n",
+    "        products_df.filter(\n",
+    "            col(\"product_number\").isNull()\n",
+    "        ).count(),\n",
+    "\n",
+    "    \"retailers_nulls\":\n",
+    "        retailers_df.filter(\n",
+    "            col(\"Retailer_code\").isNull()\n",
+    "        ).count(),\n",
+    "\n",
+    "    \"sales_nulls\":\n",
+    "        sales_df.filter(\n",
+    "            col(\"Product_number\").isNull()\n",
+    "        ).count()\n",
+    "\n",
+    "}\n",
+    "\n",
+    "for k,v in critical_checks.items():\n",
+    "\n",
+    "    if v > 0:\n",
+    "        raise Exception(\n",
+    "            f\"Gold Quality Check Failed : {k}\"\n",
+    "        )"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {},
+     "inputWidgets": {},
+     "nuid": "96c49408-940c-46b8-8ce3-d0e0bd5202a7",
+     "showTitle": true,
+     "tableResultSettingsMap": {},
+     "title": "Product Dimension"
+    }
+   },
+   "source": [
+    "## 3. Dimension Tables\n",
+    "\n",
+    "### 3.1 Product Dimension (`gold_dim_product`)\n",
+    "\n",
+    "Create product dimension with surrogate key (`product_key`) and all product attributes including `margin_pct`."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 0,
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "finishTime": 1782210852534,
+     "inputWidgets": {},
+     "nuid": "272601d8-6eb5-4f81-a706-71e0bf2716e2",
+     "showTitle": false,
+     "startTime": 1782210852115,
+     "submitTime": 1782210851627,
+     "tableResultSettingsMap": {},
+     "title": ""
+    }
+   },
+   "outputs": [],
+   "source": [
+    "dim_product = (\n",
+    "\n",
+    "    products_df\n",
+    "\n",
+    "    .withColumn(\n",
+    "        \"product_key\",\n",
+    "        monotonically_increasing_id()\n",
+    "    )\n",
+    "\n",
+    "    .select(\n",
+    "\n",
+    "        \"product_key\",\n",
+    "        \"product_number\",\n",
+    "        \"product_name\",\n",
+    "        \"product_line\",\n",
+    "        \"product_type\",\n",
+    "        \"product_brand\",\n",
+    "        \"product_color\",\n",
+    "        \"unit_cost\",\n",
+    "        \"unit_price\",\n",
+    "        \"margin_pct\"\n",
+    "\n",
+    "    )\n",
+    ")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {},
+     "inputWidgets": {},
+     "nuid": "540d4f78-0d43-471e-bb66-02d6113c508d",
+     "showTitle": true,
+     "tableResultSettingsMap": {},
+     "title": "Retailer Dimension"
+    }
+   },
+   "source": [
+    "### 3.2 Retailer Dimension (`gold_dim_retailer`)\n",
+    "\n",
+    "Create retailer dimension with surrogate key (`retailer_key`), name, type, and country."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 0,
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "finishTime": 1782210859441,
+     "inputWidgets": {},
+     "nuid": "84e2a3f2-e7b6-45df-87a0-8bed8b219cde",
+     "showTitle": false,
+     "startTime": 1782210859117,
+     "submitTime": 1782210858649,
+     "tableResultSettingsMap": {},
+     "title": ""
+    }
+   },
+   "outputs": [],
+   "source": [
+    "dim_retailer = (\n",
+    "\n",
+    "    retailers_df\n",
+    "\n",
+    "    .withColumn(\n",
+    "        \"retailer_key\",\n",
+    "        monotonically_increasing_id()\n",
+    "    )\n",
+    "\n",
+    "    .select(\n",
+    "\n",
+    "        \"retailer_key\",\n",
+    "        \"Retailer_code\",\n",
+    "        \"retailer_name\",\n",
+    "        \"retailer_type\",\n",
+    "        \"country\"\n",
+    "\n",
+    "    )\n",
+    ")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {},
+     "inputWidgets": {},
+     "nuid": "c8083826-6934-4636-890e-c095b0ea827a",
+     "showTitle": true,
+     "tableResultSettingsMap": {},
+     "title": "Order Method Dimension"
+    }
+   },
+   "source": [
+    "### 3.3 Order Method Dimension (`gold_dim_order_method`)\n",
+    "\n",
+    "Create order method dimension with surrogate key (`order_method_key`) and method type."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 0,
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "finishTime": 1782210863344,
+     "inputWidgets": {},
+     "nuid": "6af08f2c-1922-4975-88bb-d48680df6bb9",
+     "showTitle": false,
+     "startTime": 1782210862892,
+     "submitTime": 1782210862390,
+     "tableResultSettingsMap": {},
+     "title": ""
+    }
+   },
+   "outputs": [],
+   "source": [
+    "dim_order_method = (\n",
+    "\n",
+    "    methods_df\n",
+    "\n",
+    "    .withColumn(\n",
+    "        \"order_method_key\",\n",
+    "        monotonically_increasing_id()\n",
+    "    )\n",
+    "\n",
+    "    .select(\n",
+    "\n",
+    "        \"order_method_key\",\n",
+    "        \"Order_method_code\",\n",
+    "        \"order_method_type\"\n",
+    "\n",
+    "    )\n",
+    ")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {},
+     "inputWidgets": {},
+     "nuid": "6575d84f-49b6-4e97-9d59-b4c53cce826f",
+     "showTitle": true,
+     "tableResultSettingsMap": {},
+     "title": "Date Dimension"
+    }
+   },
+   "source": [
+    "### 3.4 Date Dimension (`gold_dim_date`)\n",
+    "\n",
+    "Create date dimension with `date_key` (yyyyMMdd format), year, month, month_name, quarter, day_of_week, and week_of_year."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 0,
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "finishTime": 1782210869850,
+     "inputWidgets": {},
+     "nuid": "dbe00603-41ca-4362-be68-6bb8a583a2f8",
+     "showTitle": false,
+     "startTime": 1782210869009,
+     "submitTime": 1782210868540,
+     "tableResultSettingsMap": {},
+     "title": ""
+    }
+   },
+   "outputs": [],
+   "source": [
+    "dim_date = (\n",
+    "\n",
+    "    sales_df\n",
+    "\n",
+    "    .select(\"Date\")\n",
+    "\n",
+    "    .distinct()\n",
+    "\n",
+    "    .withColumn(\n",
+    "        \"date_key\",\n",
+    "        date_format(\n",
+    "            col(\"Date\"),\n",
+    "            \"yyyyMMdd\"\n",
+    "        ).cast(\"int\")\n",
+    "    )\n",
+    "\n",
+    "    .withColumn(\n",
+    "        \"year\",\n",
+    "        year(\"Date\")\n",
+    "    )\n",
+    "\n",
+    "    .withColumn(\n",
+    "        \"month\",\n",
+    "        month(\"Date\")\n",
+    "    )\n",
+    "\n",
+    "    .withColumn(\n",
+    "        \"month_name\",\n",
+    "        date_format(\n",
+    "            col(\"Date\"),\n",
+    "            \"MMMM\"\n",
+    "        )\n",
+    "    )\n",
+    "\n",
+    "    .withColumn(\n",
+    "        \"quarter\",\n",
+    "        quarter(\"Date\")\n",
+    "    )\n",
+    "\n",
+    "    .withColumn(\n",
+    "        \"week\",\n",
+    "        weekofyear(\"Date\")\n",
+    "    )\n",
+    "\n",
+    ")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {},
+     "inputWidgets": {},
+     "nuid": "6b820c1b-050b-4462-b1d5-768793432c5a",
+     "showTitle": true,
+     "tableResultSettingsMap": {},
+     "title": "Fact Sales"
+    }
+   },
+   "source": [
+    "## 4. Fact Table (`gold_fact_sales`)\n",
+    "\n",
+    "Build the central fact table by joining sales with all dimension tables using surrogate keys. Includes `revenue`, `discount_amount`, `discount_pct`, and `Quantity` as measures."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 0,
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "finishTime": 1782210877857,
+     "inputWidgets": {},
+     "nuid": "7f33821e-df5b-49b8-b323-3b411ec1d9ff",
+     "showTitle": false,
+     "startTime": 1782210875873,
+     "submitTime": 1782210875442,
+     "tableResultSettingsMap": {},
+     "title": ""
+    }
+   },
+   "outputs": [],
+   "source": [
+    "# Use aliases to avoid ambiguous column references\n",
+    "sales_alias = sales_df.alias(\"s\")\n",
+    "prod_alias = dim_product.alias(\"p\")\n",
+    "ret_alias = dim_retailer.alias(\"r\")\n",
+    "method_alias = dim_order_method.alias(\"m\")\n",
+    "date_alias = dim_date.alias(\"d\")\n",
+    "\n",
+    "fact_sales = (\n",
+    "    sales_alias\n",
+    "    .join(\n",
+    "        prod_alias,\n",
+    "        col(\"s.Product_number\").cast(\"string\") == col(\"p.product_number\"),\n",
+    "        \"left\"\n",
+    "    )\n",
+    "    .join(\n",
+    "        ret_alias,\n",
+    "        col(\"s.Retailer_code\") == col(\"r.Retailer_code\"),\n",
+    "        \"left\"\n",
+    "    )\n",
+    "    .join(\n",
+    "        method_alias,\n",
+    "        col(\"s.Order_method_code\") == col(\"m.Order_method_code\"),\n",
+    "        \"left\"\n",
+    "    )\n",
+    "    .join(\n",
+    "        date_alias,\n",
+    "        col(\"s.Date\") == col(\"d.Date\"),\n",
+    "        \"left\"\n",
+    "    )\n",
+    "    .select(\n",
+    "        col(\"p.product_key\"),\n",
+    "        col(\"r.retailer_key\"),\n",
+    "        col(\"m.order_method_key\"),\n",
+    "        col(\"d.date_key\"),\n",
+    "        col(\"s.Quantity\"),\n",
+    "        col(\"s.revenue\"),\n",
+    "        col(\"s.discount_amount\"),\n",
+    "        col(\"s.discount_pct\")\n",
+    "    )\n",
+    ")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {},
+     "inputWidgets": {},
+     "nuid": "786d739b-c750-41c9-b841-c4d72d7bfbdc",
+     "showTitle": true,
+     "tableResultSettingsMap": {},
+     "title": "Sales KPI Summary"
+    }
+   },
+   "source": [
+    "## 5. Business KPIs & Aggregated Reports\n",
+    "\n",
+    "### 5.1 Sales KPI Summary (`gold_sales_kpi`)\n",
+    "\n",
+    "Aggregate total revenue, total discount, average discount percentage, and total quantity sold."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 0,
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "finishTime": 1782210882765,
+     "inputWidgets": {},
+     "nuid": "e0f240ee-915f-4382-956a-8784918e0b9b",
+     "showTitle": false,
+     "startTime": 1782210881497,
+     "submitTime": 1782210881028,
+     "tableResultSettingsMap": {},
+     "title": ""
+    }
+   },
+   "outputs": [
+    {
+     "output_type": "display_data",
+     "data": {
+      "text/html": [
+       "<style scoped>\n",
+       "  .table-result-container {\n",
+       "    max-height: 300px;\n",
+       "    overflow: auto;\n",
+       "  }\n",
+       "  table, th, td {\n",
+       "    border: 1px solid black;\n",
+       "    border-collapse: collapse;\n",
+       "  }\n",
+       "  th, td {\n",
+       "    padding: 5px;\n",
+       "  }\n",
+       "  th {\n",
+       "    text-align: left;\n",
+       "  }\n",
+       "</style><div class='table-result-container'><table class='table-result'><thead style='background-color: white'><tr><th>total_revenue</th><th>total_discount</th><th>avg_discount</th><th>total_quantity</th></tr></thead><tbody><tr><td>2.126224956E7</td><td>1783528.12</td><td>6.67</td><td>474055</td></tr></tbody></table></div>"
+      ]
+     },
+     "metadata": {
+      "application/vnd.databricks.v1+output": {
+       "addedWidgets": {},
+       "aggData": [],
+       "aggError": "",
+       "aggOverflow": false,
+       "aggSchema": [],
+       "aggSeriesLimitReached": false,
+       "aggType": "",
+       "arguments": {},
+       "columnCustomDisplayInfos": {},
+       "data": [
+        [
+         2.126224956E7,
+         1783528.12,
+         6.67,
+         474055
+        ]
+       ],
+       "datasetInfos": [],
+       "dbfsResultPath": null,
+       "isJsonSchema": true,
+       "metadata": {},
+       "overflow": false,
+       "plotOptions": {
+        "customPlotOptions": {},
+        "displayType": "table",
+        "pivotAggregation": null,
+        "pivotColumns": null,
+        "xColumns": null,
+        "yColumns": null
+       },
+       "removedWidgets": [],
+       "schema": [
+        {
+         "metadata": "{}",
+         "name": "total_revenue",
+         "type": "\"double\""
+        },
+        {
+         "metadata": "{}",
+         "name": "total_discount",
+         "type": "\"double\""
+        },
+        {
+         "metadata": "{}",
+         "name": "avg_discount",
+         "type": "\"double\""
+        },
+        {
+         "metadata": "{}",
+         "name": "total_quantity",
+         "type": "\"long\""
+        }
+       ],
+       "type": "table"
+      }
+     },
+     "output_type": "display_data"
+    }
+   ],
+   "source": [
+    "gold_sales_kpi = (\n",
+    "\n",
+    "    fact_sales\n",
+    "\n",
+    "    .agg(\n",
+    "\n",
+    "        round(\n",
+    "            sum(\"revenue\"),\n",
+    "            2\n",
+    "        ).alias(\"total_revenue\"),\n",
+    "\n",
+    "        round(\n",
+    "            sum(\"discount_amount\"),\n",
+    "            2\n",
+    "        ).alias(\"total_discount\"),\n",
+    "\n",
+    "        round(\n",
+    "            avg(\"discount_pct\"),\n",
+    "            2\n",
+    "        ).alias(\"avg_discount\"),\n",
+    "\n",
+    "        sum(\"Quantity\")\n",
+    "        .alias(\"total_quantity\")\n",
+    "\n",
+    "    )\n",
+    "\n",
+    ")\n",
+    "\n",
+    "display(gold_sales_kpi)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {},
+     "inputWidgets": {},
+     "nuid": "dce5d78d-c530-47c2-94f9-8e4505d42dc3",
+     "showTitle": true,
+     "tableResultSettingsMap": {},
+     "title": "Revenue By Product"
+    }
+   },
+   "source": [
+    "### 5.2 Revenue By Product (`gold_product_sales`)\n",
+    "\n",
+    "Aggregate revenue and quantity by product name and product line."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 0,
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "finishTime": 1782210894344,
+     "inputWidgets": {},
+     "nuid": "ff485bc4-54f8-4c4b-80a6-eaad6cd47803",
+     "showTitle": false,
+     "startTime": 1782210892342,
+     "submitTime": 1782210891919,
+     "tableResultSettingsMap": {},
+     "title": ""
+    }
+   },
+   "outputs": [
+    {
+     "output_type": "display_data",
+     "data": {
+      "text/html": [
+       "<style scoped>\n",
+       "  .table-result-container {\n",
+       "    max-height: 300px;\n",
+       "    overflow: auto;\n",
+       "  }\n",
+       "  table, th, td {\n",
+       "    border: 1px solid black;\n",
+       "    border-collapse: collapse;\n",
+       "  }\n",
+       "  th, td {\n",
+       "    padding: 5px;\n",
+       "  }\n",
+       "  th {\n",
+       "    text-align: left;\n",
+       "  }\n",
+       "</style><div class='table-result-container'><table class='table-result'><thead style='background-color: white'><tr><th>product_name</th><th>product_line</th><th>revenue</th><th>quantity</th></tr></thead><tbody><tr><td>Seeker 50</td><td>Personal Accessories</td><td>19705.76</td><td>158</td></tr><tr><td>Sun Shield</td><td>Outdoor Protection</td><td>179483.28</td><td>31816</td></tr><tr><td>Firefly Multi-light</td><td>Camping Equipment</td><td>57407.21</td><td>2244</td></tr><tr><td>Nan</td><td>Nan</td><td>701034.04</td><td>1432</td></tr><tr><td>Polar Ice</td><td>Personal Accessories</td><td>195699.9</td><td>1913</td></tr><tr><td>Hibernator Camp Cot</td><td>Camping Equipment</td><td>600244.16</td><td>8170</td></tr><tr><td>Bugshield Natural</td><td>Outdoor Protection</td><td>73349.1</td><td>13145</td></tr><tr><td>Hibernator Pad</td><td>Camping Equipment</td><td>433284.14</td><td>12445</td></tr><tr><td>Seeker Extreme</td><td>Personal Accessories</td><td>47056.76</td><td>277</td></tr><tr><td>Single Edge</td><td>Personal Accessories</td><td>276840.32</td><td>21940</td></tr><tr><td>Polar Sun</td><td>Personal Accessories</td><td>72818.95</td><td>1261</td></tr><tr><td>Trailchef Kettle</td><td>Camping Equipment</td><td>339095.95</td><td>29224</td></tr><tr><td>Edge Extreme</td><td>Personal Accessories</td><td>64559.8</td><td>580</td></tr><tr><td>Hibernator Extreme</td><td>Camping Equipment</td><td>124276.32</td><td>504</td></tr><tr><td>Course Pro Gloves</td><td>Golf Equipment</td><td>34589.99</td><td>3356</td></tr><tr><td>Star Gazer 2</td><td>Camping Equipment</td><td>763726.5</td><td>1410</td></tr><tr><td>Sun Shelter 15</td><td>Outdoor Protection</td><td>53398.05</td><td>11274</td></tr><tr><td>Trailchef Double Flame</td><td>Camping Equipment</td><td>185047.65</td><td>1311</td></tr><tr><td>Trailchef Cook Set</td><td>Camping Equipment</td><td>79190.27</td><td>1514</td></tr><tr><td>Canyon Mule Weekender Backpack</td><td>Nan</td><td>1482015.12</td><td>5574</td></tr><tr><td>Firefly 2</td><td>Camping Equipment</td><td>398068.0</td><td>16892</td></tr><tr><td>Hibernator Pillow</td><td>Camping Equipment</td><td>149743.34</td><td>9544</td></tr><tr><td>Calamine Relief</td><td>Outdoor Protection</td><td>7329.48</td><td>1246</td></tr><tr><td>Trailchef Kitchen Kit</td><td>Camping Equipment</td><td>532124.12</td><td>23828</td></tr><tr><td>Glacier Gps Extreme</td><td>Personal Accessories</td><td>33777.43</td><td>101</td></tr><tr><td>Mountain Man Analog</td><td>Personal Accessories</td><td>16187.4</td><td>345</td></tr><tr><td>Everglow Double</td><td>Camping Equipment</td><td>54879.02</td><td>1070</td></tr><tr><td>Course Pro Golf And Tee Set</td><td>Golf Equipment</td><td>82717.48</td><td>8351</td></tr><tr><td>Lady Hailstorm Titanium Irons</td><td>Golf Equipment</td><td>505995.48</td><td>612</td></tr><tr><td>Canyon Mule Journey Backpack</td><td>Camping Equipment</td><td>1200775.56</td><td>3531</td></tr><tr><td>Mountain Man Deluxe</td><td>Personal Accessories</td><td>12361.92</td><td>163</td></tr><tr><td>Deluxe Family Relief Kit</td><td>Outdoor Protection</td><td>402937.15</td><td>12115</td></tr><tr><td>Course Pro Umbrella</td><td>Golf Equipment</td><td>99160.59</td><td>8054</td></tr><tr><td>Everglow Single</td><td>Camping Equipment</td><td>82603.84</td><td>2726</td></tr><tr><td>Bugshield Spray</td><td>Outdoor Protection</td><td>66643.98</td><td>11922</td></tr><tr><td>Canyon Mule Climber Backpack</td><td>Nan</td><td>25303.92</td><td>354</td></tr><tr><td>Lady Hailstorm Steel Woods Set</td><td>Golf Equipment</td><td>394957.71</td><td>466</td></tr><tr><td>Polar Wave</td><td>Personal Accessories</td><td>47094.45</td><td>510</td></tr><tr><td>Bugshield Extreme</td><td>Outdoor Protection</td><td>159189.03</td><td>24453</td></tr><tr><td>Course Pro Putter</td><td>Golf Equipment</td><td>406006.4</td><td>5680</td></tr><tr><td>Mountain Man Extreme</td><td>Personal Accessories</td><td>64883.49</td><td>237</td></tr><tr><td>Firefly Mapreader</td><td>Camping Equipment</td><td>169585.29</td><td>10792</td></tr><tr><td>Double Edge</td><td>Personal Accessories</td><td>118417.18</td><td>7598</td></tr><tr><td>Sun Shelter Stick</td><td>Outdoor Protection</td><td>64134.7</td><td>13754</td></tr><tr><td>Hailstorm Steel Irons</td><td>Golf Equipment</td><td>345793.3</td><td>655</td></tr><tr><td>Bugshield Lotion</td><td>Outdoor Protection</td><td>325277.54</td><td>49041</td></tr><tr><td>Lady Hailstorm Titanium Woods Set</td><td>Golf Equipment</td><td>422356.36</td><td>334</td></tr><tr><td>Firefly Lite</td><td>Camping Equipment</td><td>77901.06</td><td>5592</td></tr><tr><td>Firefly Extreme</td><td>Camping Equipment</td><td>24890.14</td><td>506</td></tr><tr><td>Polar Sports</td><td>Personal Accessories</td><td>248759.8</td><td>2180</td></tr><tr><td>Star Gazer 6</td><td>Camping Equipment</td><td>876745.24</td><td>1132</td></tr><tr><td>Everglow Kerosene</td><td>Camping Equipment</td><td>79155.22</td><td>2878</td></tr><tr><td>Hailstorm Steel Woods Set</td><td>Golf Equipment</td><td>400890.16</td><td>384</td></tr><tr><td>Course Pro Golf Bag</td><td>Golf Equipment</td><td>395280.04</td><td>1979</td></tr><tr><td>Blue Steel Putter</td><td>Golf Equipment</td><td>430010.02</td><td>5262</td></tr><tr><td>Hailstorm Titanium Irons</td><td>Nan</td><td>550068.61</td><td>637</td></tr><tr><td>Everglow Butane</td><td>Camping Equipment</td><td>55494.19</td><td>881</td></tr><tr><td>Aloe Relief</td><td>Outdoor Protection</td><td>11804.11</td><td>2257</td></tr><tr><td>Compact Relief Kit</td><td>Outdoor Protection</td><td>71599.92</td><td>3254</td></tr><tr><td>Canyon Mule Carryall</td><td>Camping Equipment</td><td>775544.2</td><td>11345</td></tr><tr><td>Blue Steel Max Putter</td><td>Golf Equipment</td><td>303389.94</td><td>1806</td></tr><tr><td>Polar Extreme</td><td>Personal Accessories</td><td>29362.19</td><td>208</td></tr><tr><td>Hibernator Self - Inflating Mat</td><td>Camping Equipment</td><td>39295.52</td><td>332</td></tr><tr><td>Hailstorm Titanium Woods Set</td><td>Golf Equipment</td><td>780186.0</td><td>660</td></tr><tr><td>Canyon Mule Cooler</td><td>Camping Equipment</td><td>24155.25</td><td>749</td></tr><tr><td>Bear Edge</td><td>Personal Accessories</td><td>81279.14</td><td>2109</td></tr><tr><td>Trailchef Single Flame</td><td>Camping Equipment</td><td>223866.63</td><td>3633</td></tr><tr><td>Trailchef Deluxe Cook Set</td><td>Camping Equipment</td><td>417535.04</td><td>3461</td></tr><tr><td>Seeker Mini</td><td>Personal Accessories</td><td>42808.66</td><td>538</td></tr><tr><td>Glacier Deluxe</td><td>Personal Accessories</td><td>24754.44</td><td>276</td></tr><tr><td>Star Dome</td><td>Camping Equipment</td><td>337168.81</td><td>557</td></tr></tbody></table></div>"
+      ]
+     },
+     "metadata": {
+      "application/vnd.databricks.v1+output": {
+       "addedWidgets": {},
+       "aggData": [],
+       "aggError": "",
+       "aggOverflow": false,
+       "aggSchema": [],
+       "aggSeriesLimitReached": false,
+       "aggType": "",
+       "arguments": {},
+       "columnCustomDisplayInfos": {},
+       "data": [
+        [
+         "Seeker 50",
+         "Personal Accessories",
+         19705.76,
+         158
+        ],
+        [
+         "Sun Shield",
+         "Outdoor Protection",
+         179483.28,
+         31816
+        ],
+        [
+         "Firefly Multi-light",
+         "Camping Equipment",
+         57407.21,
+         2244
+        ],
+        [
+         "Nan",
+         "Nan",
+         701034.04,
+         1432
+        ],
+        [
+         "Polar Ice",
+         "Personal Accessories",
+         195699.9,
+         1913
+        ],
+        [
+         "Hibernator Camp Cot",
+         "Camping Equipment",
+         600244.16,
+         8170
+        ],
+        [
+         "Bugshield Natural",
+         "Outdoor Protection",
+         73349.1,
+         13145
+        ],
+        [
+         "Hibernator Pad",
+         "Camping Equipment",
+         433284.14,
+         12445
+        ],
+        [
+         "Seeker Extreme",
+         "Personal Accessories",
+         47056.76,
+         277
+        ],
+        [
+         "Single Edge",
+         "Personal Accessories",
+         276840.32,
+         21940
+        ],
+        [
+         "Polar Sun",
+         "Personal Accessories",
+         72818.95,
+         1261
+        ],
+        [
+         "Trailchef Kettle",
+         "Camping Equipment",
+         339095.95,
+         29224
+        ],
+        [
+         "Edge Extreme",
+         "Personal Accessories",
+         64559.8,
+         580
+        ],
+        [
+         "Hibernator Extreme",
+         "Camping Equipment",
+         124276.32,
+         504
+        ],
+        [
+         "Course Pro Gloves",
+         "Golf Equipment",
+         34589.99,
+         3356
+        ],
+        [
+         "Star Gazer 2",
+         "Camping Equipment",
+         763726.5,
+         1410
+        ],
+        [
+         "Sun Shelter 15",
+         "Outdoor Protection",
+         53398.05,
+         11274
+        ],
+        [
+         "Trailchef Double Flame",
+         "Camping Equipment",
+         185047.65,
+         1311
+        ],
+        [
+         "Trailchef Cook Set",
+         "Camping Equipment",
+         79190.27,
+         1514
+        ],
+        [
+         "Canyon Mule Weekender Backpack",
+         "Nan",
+         1482015.12,
+         5574
+        ],
+        [
+         "Firefly 2",
+         "Camping Equipment",
+         398068.0,
+         16892
+        ],
+        [
+         "Hibernator Pillow",
+         "Camping Equipment",
+         149743.34,
+         9544
+        ],
+        [
+         "Calamine Relief",
+         "Outdoor Protection",
+         7329.48,
+         1246
+        ],
+        [
+         "Trailchef Kitchen Kit",
+         "Camping Equipment",
+         532124.12,
+         23828
+        ],
+        [
+         "Glacier Gps Extreme",
+         "Personal Accessories",
+         33777.43,
+         101
+        ],
+        [
+         "Mountain Man Analog",
+         "Personal Accessories",
+         16187.4,
+         345
+        ],
+        [
+         "Everglow Double",
+         "Camping Equipment",
+         54879.02,
+         1070
+        ],
+        [
+         "Course Pro Golf And Tee Set",
+         "Golf Equipment",
+         82717.48,
+         8351
+        ],
+        [
+         "Lady Hailstorm Titanium Irons",
+         "Golf Equipment",
+         505995.48,
+         612
+        ],
+        [
+         "Canyon Mule Journey Backpack",
+         "Camping Equipment",
+         1200775.56,
+         3531
+        ],
+        [
+         "Mountain Man Deluxe",
+         "Personal Accessories",
+         12361.92,
+         163
+        ],
+        [
+         "Deluxe Family Relief Kit",
+         "Outdoor Protection",
+         402937.15,
+         12115
+        ],
+        [
+         "Course Pro Umbrella",
+         "Golf Equipment",
+         99160.59,
+         8054
+        ],
+        [
+         "Everglow Single",
+         "Camping Equipment",
+         82603.84,
+         2726
+        ],
+        [
+         "Bugshield Spray",
+         "Outdoor Protection",
+         66643.98,
+         11922
+        ],
+        [
+         "Canyon Mule Climber Backpack",
+         "Nan",
+         25303.92,
+         354
+        ],
+        [
+         "Lady Hailstorm Steel Woods Set",
+         "Golf Equipment",
+         394957.71,
+         466
+        ],
+        [
+         "Polar Wave",
+         "Personal Accessories",
+         47094.45,
+         510
+        ],
+        [
+         "Bugshield Extreme",
+         "Outdoor Protection",
+         159189.03,
+         24453
+        ],
+        [
+         "Course Pro Putter",
+         "Golf Equipment",
+         406006.4,
+         5680
+        ],
+        [
+         "Mountain Man Extreme",
+         "Personal Accessories",
+         64883.49,
+         237
+        ],
+        [
+         "Firefly Mapreader",
+         "Camping Equipment",
+         169585.29,
+         10792
+        ],
+        [
+         "Double Edge",
+         "Personal Accessories",
+         118417.18,
+         7598
+        ],
+        [
+         "Sun Shelter Stick",
+         "Outdoor Protection",
+         64134.7,
+         13754
+        ],
+        [
+         "Hailstorm Steel Irons",
+         "Golf Equipment",
+         345793.3,
+         655
+        ],
+        [
+         "Bugshield Lotion",
+         "Outdoor Protection",
+         325277.54,
+         49041
+        ],
+        [
+         "Lady Hailstorm Titanium Woods Set",
+         "Golf Equipment",
+         422356.36,
+         334
+        ],
+        [
+         "Firefly Lite",
+         "Camping Equipment",
+         77901.06,
+         5592
+        ],
+        [
+         "Firefly Extreme",
+         "Camping Equipment",
+         24890.14,
+         506
+        ],
+        [
+         "Polar Sports",
+         "Personal Accessories",
+         248759.8,
+         2180
+        ],
+        [
+         "Star Gazer 6",
+         "Camping Equipment",
+         876745.24,
+         1132
+        ],
+        [
+         "Everglow Kerosene",
+         "Camping Equipment",
+         79155.22,
+         2878
+        ],
+        [
+         "Hailstorm Steel Woods Set",
+         "Golf Equipment",
+         400890.16,
+         384
+        ],
+        [
+         "Course Pro Golf Bag",
+         "Golf Equipment",
+         395280.04,
+         1979
+        ],
+        [
+         "Blue Steel Putter",
+         "Golf Equipment",
+         430010.02,
+         5262
+        ],
+        [
+         "Hailstorm Titanium Irons",
+         "Nan",
+         550068.61,
+         637
+        ],
+        [
+         "Everglow Butane",
+         "Camping Equipment",
+         55494.19,
+         881
+        ],
+        [
+         "Aloe Relief",
+         "Outdoor Protection",
+         11804.11,
+         2257
+        ],
+        [
+         "Compact Relief Kit",
+         "Outdoor Protection",
+         71599.92,
+         3254
+        ],
+        [
+         "Canyon Mule Carryall",
+         "Camping Equipment",
+         775544.2,
+         11345
+        ],
+        [
+         "Blue Steel Max Putter",
+         "Golf Equipment",
+         303389.94,
+         1806
+        ],
+        [
+         "Polar Extreme",
+         "Personal Accessories",
+         29362.19,
+         208
+        ],
+        [
+         "Hibernator Self - Inflating Mat",
+         "Camping Equipment",
+         39295.52,
+         332
+        ],
+        [
+         "Hailstorm Titanium Woods Set",
+         "Golf Equipment",
+         780186.0,
+         660
+        ],
+        [
+         "Canyon Mule Cooler",
+         "Camping Equipment",
+         24155.25,
+         749
+        ],
+        [
+         "Bear Edge",
+         "Personal Accessories",
+         81279.14,
+         2109
+        ],
+        [
+         "Trailchef Single Flame",
+         "Camping Equipment",
+         223866.63,
+         3633
+        ],
+        [
+         "Trailchef Deluxe Cook Set",
+         "Camping Equipment",
+         417535.04,
+         3461
+        ],
+        [
+         "Seeker Mini",
+         "Personal Accessories",
+         42808.66,
+         538
+        ],
+        [
+         "Glacier Deluxe",
+         "Personal Accessories",
+         24754.44,
+         276
+        ],
+        [
+         "Star Dome",
+         "Camping Equipment",
+         337168.81,
+         557
+        ]
+       ],
+       "datasetInfos": [],
+       "dbfsResultPath": null,
+       "isJsonSchema": true,
+       "metadata": {},
+       "overflow": false,
+       "plotOptions": {
+        "customPlotOptions": {},
+        "displayType": "table",
+        "pivotAggregation": null,
+        "pivotColumns": null,
+        "xColumns": null,
+        "yColumns": null
+       },
+       "removedWidgets": [],
+       "schema": [
+        {
+         "metadata": "{}",
+         "name": "product_name",
+         "type": "\"string\""
+        },
+        {
+         "metadata": "{}",
+         "name": "product_line",
+         "type": "\"string\""
+        },
+        {
+         "metadata": "{}",
+         "name": "revenue",
+         "type": "\"double\""
+        },
+        {
+         "metadata": "{}",
+         "name": "quantity",
+         "type": "\"long\""
+        }
+       ],
+       "type": "table"
+      }
+     },
+     "output_type": "display_data"
+    }
+   ],
+   "source": [
+    "gold_product_sales = (\n",
+    "\n",
+    "    fact_sales\n",
+    "\n",
+    "    .join(\n",
+    "        dim_product,\n",
+    "        \"product_key\"\n",
+    "    )\n",
+    "\n",
+    "    .groupBy(\n",
+    "\n",
+    "        \"product_name\",\n",
+    "        \"product_line\"\n",
+    "\n",
+    "    )\n",
+    "\n",
+    "    .agg(\n",
+    "\n",
+    "        round(\n",
+    "            sum(\"revenue\"),\n",
+    "            2\n",
+    "        ).alias(\"revenue\"),\n",
+    "\n",
+    "        sum(\"Quantity\")\n",
+    "        .alias(\"quantity\")\n",
+    "\n",
+    "    )\n",
+    "\n",
+    ")\n",
+    "\n",
+    "display(gold_product_sales)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {},
+     "inputWidgets": {},
+     "nuid": "a4742b25-c2e6-47ea-9f6d-efdf664cf1dc",
+     "showTitle": true,
+     "tableResultSettingsMap": {},
+     "title": "Revenue By Country"
+    }
+   },
+   "source": [
+    "### 5.3 Revenue By Country (`gold_country_sales`)\n",
+    "\n",
+    "Aggregate revenue and quantity by retailer country."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 0,
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "finishTime": 1782210900751,
+     "inputWidgets": {},
+     "nuid": "c975ea6d-3a68-4c07-b2cf-b7305cecc709",
+     "showTitle": false,
+     "startTime": 1782210898900,
+     "submitTime": 1782210898348,
+     "tableResultSettingsMap": {},
+     "title": ""
+    }
+   },
+   "outputs": [
+    {
+     "output_type": "display_data",
+     "data": {
+      "text/html": [
+       "<style scoped>\n",
+       "  .table-result-container {\n",
+       "    max-height: 300px;\n",
+       "    overflow: auto;\n",
+       "  }\n",
+       "  table, th, td {\n",
+       "    border: 1px solid black;\n",
+       "    border-collapse: collapse;\n",
+       "  }\n",
+       "  th, td {\n",
+       "    padding: 5px;\n",
+       "  }\n",
+       "  th {\n",
+       "    text-align: left;\n",
+       "  }\n",
+       "</style><div class='table-result-container'><table class='table-result'><thead style='background-color: white'><tr><th>country</th><th>revenue</th><th>quantity</th></tr></thead><tbody><tr><td>United States</td><td>2.126224956E7</td><td>474055</td></tr></tbody></table></div>"
+      ]
+     },
+     "metadata": {
+      "application/vnd.databricks.v1+output": {
+       "addedWidgets": {},
+       "aggData": [],
+       "aggError": "",
+       "aggOverflow": false,
+       "aggSchema": [],
+       "aggSeriesLimitReached": false,
+       "aggType": "",
+       "arguments": {},
+       "columnCustomDisplayInfos": {},
+       "data": [
+        [
+         "United States",
+         2.126224956E7,
+         474055
+        ]
+       ],
+       "datasetInfos": [],
+       "dbfsResultPath": null,
+       "isJsonSchema": true,
+       "metadata": {},
+       "overflow": false,
+       "plotOptions": {
+        "customPlotOptions": {},
+        "displayType": "table",
+        "pivotAggregation": null,
+        "pivotColumns": null,
+        "xColumns": null,
+        "yColumns": null
+       },
+       "removedWidgets": [],
+       "schema": [
+        {
+         "metadata": "{}",
+         "name": "country",
+         "type": "\"string\""
+        },
+        {
+         "metadata": "{}",
+         "name": "revenue",
+         "type": "\"double\""
+        },
+        {
+         "metadata": "{}",
+         "name": "quantity",
+         "type": "\"long\""
+        }
+       ],
+       "type": "table"
+      }
+     },
+     "output_type": "display_data"
+    }
+   ],
+   "source": [
+    "gold_country_sales = (\n",
+    "\n",
+    "    fact_sales\n",
+    "\n",
+    "    .join(\n",
+    "        dim_retailer,\n",
+    "        \"retailer_key\"\n",
+    "    )\n",
+    "\n",
+    "    .groupBy(\n",
+    "        \"country\"\n",
+    "    )\n",
+    "\n",
+    "    .agg(\n",
+    "\n",
+    "        round(\n",
+    "            sum(\"revenue\"),\n",
+    "            2\n",
+    "        ).alias(\"revenue\"),\n",
+    "\n",
+    "        sum(\"Quantity\")\n",
+    "        .alias(\"quantity\")\n",
+    "\n",
+    "    )\n",
+    "\n",
+    ")\n",
+    "\n",
+    "display(gold_country_sales)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {},
+     "inputWidgets": {},
+     "nuid": "661b906f-e1d8-41f6-8f9e-5b38d0337e3e",
+     "showTitle": true,
+     "tableResultSettingsMap": {},
+     "title": "Revenue By Year"
+    }
+   },
+   "source": [
+    "### 5.4 Revenue By Year (`gold_yearly_sales`)\n",
+    "\n",
+    "Aggregate revenue and quantity by calendar year using the date dimension."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 0,
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "finishTime": 1782210905257,
+     "inputWidgets": {},
+     "nuid": "596c292c-27ba-4454-ab85-1bded8b1f00e",
+     "showTitle": false,
+     "startTime": 1782210903213,
+     "submitTime": 1782210902648,
+     "tableResultSettingsMap": {},
+     "title": ""
+    }
+   },
+   "outputs": [
+    {
+     "output_type": "display_data",
+     "data": {
+      "text/html": [
+       "<style scoped>\n",
+       "  .table-result-container {\n",
+       "    max-height: 300px;\n",
+       "    overflow: auto;\n",
+       "  }\n",
+       "  table, th, td {\n",
+       "    border: 1px solid black;\n",
+       "    border-collapse: collapse;\n",
+       "  }\n",
+       "  th, td {\n",
+       "    padding: 5px;\n",
+       "  }\n",
+       "  th {\n",
+       "    text-align: left;\n",
+       "  }\n",
+       "</style><div class='table-result-container'><table class='table-result'><thead style='background-color: white'><tr><th>year</th><th>revenue</th><th>quantity</th></tr></thead><tbody><tr><td>2015</td><td>2.126224956E7</td><td>474055</td></tr></tbody></table></div>"
+      ]
+     },
+     "metadata": {
+      "application/vnd.databricks.v1+output": {
+       "addedWidgets": {},
+       "aggData": [],
+       "aggError": "",
+       "aggOverflow": false,
+       "aggSchema": [],
+       "aggSeriesLimitReached": false,
+       "aggType": "",
+       "arguments": {},
+       "columnCustomDisplayInfos": {},
+       "data": [
+        [
+         2015,
+         2.126224956E7,
+         474055
+        ]
+       ],
+       "datasetInfos": [],
+       "dbfsResultPath": null,
+       "isJsonSchema": true,
+       "metadata": {},
+       "overflow": false,
+       "plotOptions": {
+        "customPlotOptions": {},
+        "displayType": "table",
+        "pivotAggregation": null,
+        "pivotColumns": null,
+        "xColumns": null,
+        "yColumns": null
+       },
+       "removedWidgets": [],
+       "schema": [
+        {
+         "metadata": "{}",
+         "name": "year",
+         "type": "\"integer\""
+        },
+        {
+         "metadata": "{}",
+         "name": "revenue",
+         "type": "\"double\""
+        },
+        {
+         "metadata": "{}",
+         "name": "quantity",
+         "type": "\"long\""
+        }
+       ],
+       "type": "table"
+      }
+     },
+     "output_type": "display_data"
+    }
+   ],
+   "source": [
+    "gold_yearly_sales = (\n",
+    "\n",
+    "    fact_sales\n",
+    "\n",
+    "    .join(\n",
+    "        dim_date,\n",
+    "        \"date_key\"\n",
+    "    )\n",
+    "\n",
+    "    .groupBy(\n",
+    "        \"year\"\n",
+    "    )\n",
+    "\n",
+    "    .agg(\n",
+    "\n",
+    "        round(\n",
+    "            sum(\"revenue\"),\n",
+    "            2\n",
+    "        ).alias(\"revenue\"),\n",
+    "\n",
+    "        sum(\"Quantity\")\n",
+    "        .alias(\"quantity\")\n",
+    "\n",
+    "    )\n",
+    "\n",
+    ")\n",
+    "\n",
+    "display(gold_yearly_sales)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {},
+     "inputWidgets": {},
+     "nuid": "e6343447-b2be-4829-8912-466e87215a7c",
+     "showTitle": true,
+     "tableResultSettingsMap": {},
+     "title": "Top 10 Products"
+    }
+   },
+   "source": [
+    "### 5.5 Top 10 Products (`gold_top_products`)\n",
+    "\n",
+    "Rank products by total revenue and select the top 10 performers."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 0,
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "finishTime": 1782210911063,
+     "inputWidgets": {},
+     "nuid": "9edbb5b7-f085-49d1-bd1d-9de4350b2a0c",
+     "showTitle": false,
+     "startTime": 1782210908413,
+     "submitTime": 1782210907889,
+     "tableResultSettingsMap": {},
+     "title": ""
+    }
+   },
+   "outputs": [
+    {
+     "output_type": "display_data",
+     "data": {
+      "text/html": [
+       "<style scoped>\n",
+       "  .table-result-container {\n",
+       "    max-height: 300px;\n",
+       "    overflow: auto;\n",
+       "  }\n",
+       "  table, th, td {\n",
+       "    border: 1px solid black;\n",
+       "    border-collapse: collapse;\n",
+       "  }\n",
+       "  th, td {\n",
+       "    padding: 5px;\n",
+       "  }\n",
+       "  th {\n",
+       "    text-align: left;\n",
+       "  }\n",
+       "</style><div class='table-result-container'><table class='table-result'><thead style='background-color: white'><tr><th>product_name</th><th>revenue</th></tr></thead><tbody><tr><td>Canyon Mule Weekender Backpack</td><td>1482015.12</td></tr><tr><td>Canyon Mule Journey Backpack</td><td>1200775.56</td></tr><tr><td>Star Gazer 6</td><td>876745.24</td></tr><tr><td>Hailstorm Titanium Woods Set</td><td>780186.0</td></tr><tr><td>Canyon Mule Carryall</td><td>775544.2</td></tr><tr><td>Star Gazer 2</td><td>763726.5</td></tr><tr><td>Nan</td><td>701034.04</td></tr><tr><td>Hibernator Camp Cot</td><td>600244.16</td></tr><tr><td>Hailstorm Titanium Irons</td><td>550068.61</td></tr><tr><td>Trailchef Kitchen Kit</td><td>532124.12</td></tr></tbody></table></div>"
+      ]
+     },
+     "metadata": {
+      "application/vnd.databricks.v1+output": {
+       "addedWidgets": {},
+       "aggData": [],
+       "aggError": "",
+       "aggOverflow": false,
+       "aggSchema": [],
+       "aggSeriesLimitReached": false,
+       "aggType": "",
+       "arguments": {},
+       "columnCustomDisplayInfos": {},
+       "data": [
+        [
+         "Canyon Mule Weekender Backpack",
+         1482015.12
+        ],
+        [
+         "Canyon Mule Journey Backpack",
+         1200775.56
+        ],
+        [
+         "Star Gazer 6",
+         876745.24
+        ],
+        [
+         "Hailstorm Titanium Woods Set",
+         780186.0
+        ],
+        [
+         "Canyon Mule Carryall",
+         775544.2
+        ],
+        [
+         "Star Gazer 2",
+         763726.5
+        ],
+        [
+         "Nan",
+         701034.04
+        ],
+        [
+         "Hibernator Camp Cot",
+         600244.16
+        ],
+        [
+         "Hailstorm Titanium Irons",
+         550068.61
+        ],
+        [
+         "Trailchef Kitchen Kit",
+         532124.12
+        ]
+       ],
+       "datasetInfos": [],
+       "dbfsResultPath": null,
+       "isJsonSchema": true,
+       "metadata": {},
+       "overflow": false,
+       "plotOptions": {
+        "customPlotOptions": {},
+        "displayType": "table",
+        "pivotAggregation": null,
+        "pivotColumns": null,
+        "xColumns": null,
+        "yColumns": null
+       },
+       "removedWidgets": [],
+       "schema": [
+        {
+         "metadata": "{}",
+         "name": "product_name",
+         "type": "\"string\""
+        },
+        {
+         "metadata": "{}",
+         "name": "revenue",
+         "type": "\"double\""
+        }
+       ],
+       "type": "table"
+      }
+     },
+     "output_type": "display_data"
+    }
+   ],
+   "source": [
+    "gold_top_products = (\n",
+    "\n",
+    "    fact_sales\n",
+    "\n",
+    "    .join(\n",
+    "        dim_product,\n",
+    "        \"product_key\"\n",
+    "    )\n",
+    "\n",
+    "    .groupBy(\n",
+    "        \"product_name\"\n",
+    "    )\n",
+    "\n",
+    "    .agg(\n",
+    "\n",
+    "        round(\n",
+    "            sum(\"revenue\"),\n",
+    "            2\n",
+    "        ).alias(\"revenue\")\n",
+    "\n",
+    "    )\n",
+    "\n",
+    "    .orderBy(\n",
+    "        desc(\"revenue\")\n",
+    "    )\n",
+    "\n",
+    "    .limit(10)\n",
+    "\n",
+    ")\n",
+    "\n",
+    "display(gold_top_products)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {},
+     "inputWidgets": {},
+     "nuid": "0c1f890a-b6ed-415e-bd36-eb39a1a6a709",
+     "showTitle": true,
+     "tableResultSettingsMap": {},
+     "title": "Write Gold Tables"
+    }
+   },
+   "source": [
+    "## 6. Write Gold Tables\n",
+    "\n",
+    "Persist all dimension tables, fact table, and aggregated reporting tables to Delta with schema evolution. Then apply `OPTIMIZE` and `ZORDER` for query performance."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 0,
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "finishTime": 1782210978325,
+     "inputWidgets": {},
+     "nuid": "85e324bb-3a15-4c68-9c79-92efe7fefc4b",
+     "showTitle": true,
+     "startTime": 1782210932846,
+     "submitTime": 1782210932411,
+     "tableResultSettingsMap": {},
+     "title": "Write Gold Tables with Schema Evolution"
+    }
+   },
+   "outputs": [
+    {
+     "output_type": "stream",
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Writing dim_product...\nWriting dim_retailer...\nWriting dim_order_method...\nWriting dim_date...\nWriting fact_sales...\nWriting gold_sales_kpi...\nWriting gold_product_sales...\nWriting gold_country_sales...\nWriting gold_yearly_sales...\nWriting gold_top_products...\n\n✅ All Gold tables written to: /mnt/gosales/gold/\n"
+     ]
+    }
+   ],
+   "source": [
+    "# Write dimension tables first with schema evolution\n",
+    "print(\"Writing dim_product...\")\n",
+    "dim_product.write.format(\"delta\").mode(\"overwrite\").option(\"mergeSchema\", \"true\").saveAsTable(f\"{schema}.gold_dim_product\")\n",
+    "\n",
+    "print(\"Writing dim_retailer...\")\n",
+    "dim_retailer.write.format(\"delta\").mode(\"overwrite\").option(\"mergeSchema\", \"true\").saveAsTable(f\"{schema}.gold_dim_retailer\")\n",
+    "\n",
+    "print(\"Writing dim_order_method...\")\n",
+    "dim_order_method.write.format(\"delta\").mode(\"overwrite\").option(\"mergeSchema\", \"true\").saveAsTable(f\"{schema}.gold_dim_order_method\")\n",
+    "\n",
+    "print(\"Writing dim_date...\")\n",
+    "dim_date.write.format(\"delta\").mode(\"overwrite\").option(\"mergeSchema\", \"true\").saveAsTable(f\"{schema}.gold_dim_date\")\n",
+    "\n",
+    "# Write fact table\n",
+    "print(\"Writing fact_sales...\")\n",
+    "fact_sales.write.format(\"delta\").mode(\"overwrite\").option(\"mergeSchema\", \"true\").saveAsTable(f\"{schema}.gold_fact_sales\")\n",
+    "\n",
+    "# Write aggregates\n",
+    "print(\"Writing gold_sales_kpi...\")\n",
+    "gold_sales_kpi.write.format(\"delta\").mode(\"overwrite\").option(\"mergeSchema\", \"true\").saveAsTable(f\"{schema}.gold_sales_kpi\")\n",
+    "\n",
+    "print(\"Writing gold_product_sales...\")\n",
+    "gold_product_sales.write.format(\"delta\").mode(\"overwrite\").option(\"mergeSchema\", \"true\").saveAsTable(f\"{schema}.gold_product_sales\")\n",
+    "\n",
+    "print(\"Writing gold_country_sales...\")\n",
+    "gold_country_sales.write.format(\"delta\").mode(\"overwrite\").option(\"mergeSchema\", \"true\").saveAsTable(f\"{schema}.gold_country_sales\")\n",
+    "\n",
+    "print(\"Writing gold_yearly_sales...\")\n",
+    "gold_yearly_sales.write.format(\"delta\").mode(\"overwrite\").option(\"mergeSchema\", \"true\").saveAsTable(f\"{schema}.gold_yearly_sales\")\n",
+    "\n",
+    "print(\"Writing gold_top_products...\")\n",
+    "gold_top_products.write.format(\"delta\").mode(\"overwrite\").option(\"mergeSchema\", \"true\").saveAsTable(f\"{schema}.gold_top_products\")\n",
+    "\n",
+    "print(\"✅ All Gold tables written successfully with schema evolution enabled!\")"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 0,
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "implicitDf": true,
+      "rowLimit": 10000
+     },
+     "finishTime": 1782210986031,
+     "inputWidgets": {},
+     "nuid": "a8c29964-86ab-414d-ba47-3b20ac09e0da",
+     "showTitle": true,
+     "startTime": 1782210981390,
+     "submitTime": 1782210980945,
+     "tableResultSettingsMap": {},
+     "title": "Optimize Gold Tables"
+    }
+   },
+   "outputs": [
+    {
+     "output_type": "display_data",
+     "data": {
+      "text/html": [
+       "<style scoped>\n",
+       "  .table-result-container {\n",
+       "    max-height: 300px;\n",
+       "    overflow: auto;\n",
+       "  }\n",
+       "  table, th, td {\n",
+       "    border: 1px solid black;\n",
+       "    border-collapse: collapse;\n",
+       "  }\n",
+       "  th, td {\n",
+       "    padding: 5px;\n",
+       "  }\n",
+       "  th {\n",
+       "    text-align: left;\n",
+       "  }\n",
+       "</style><div class='table-result-container'><table class='table-result'><thead style='background-color: white'><tr><th>path</th><th>metrics</th></tr></thead><tbody><tr><td>dbfs:/mnt/gosales/gold/gold_dim_retailer</td><td>List(0, 0, List(null, null, 0.0, 0, 0), List(null, null, 0.0, 0, 0), 0, null, 0, 1, 1, true, 0, 0, 1782210985602, 1782210985788, 4, 0, null, List(0, 0), 5, 5, 0, 0, null)</td></tr></tbody></table></div>"
+      ]
+     },
+     "metadata": {
+      "application/vnd.databricks.v1+output": {
+       "addedWidgets": {},
+       "aggData": [],
+       "aggError": "",
+       "aggOverflow": false,
+       "aggSchema": [],
+       "aggSeriesLimitReached": false,
+       "aggType": "",
+       "arguments": {},
+       "columnCustomDisplayInfos": {},
+       "data": [
+        [
+         "dbfs:/mnt/gosales/gold/gold_dim_retailer",
+         [
+          0,
+          0,
+          [
+           null,
+           null,
+           0.0,
+           0,
+           0
+          ],
+          [
+           null,
+           null,
+           0.0,
+           0,
+           0
+          ],
+          0,
+          null,
+          0,
+          1,
+          1,
+          true,
+          0,
+          0,
+          1782210985602,
+          1782210985788,
+          4,
+          0,
+          null,
+          [
+           0,
+           0
+          ],
+          5,
+          5,
+          0,
+          0,
+          null
+         ]
+        ]
+       ],
+       "datasetInfos": [],
+       "dbfsResultPath": null,
+       "isJsonSchema": true,
+       "metadata": {
+        "dataframeName": "_sqldf",
+        "executionCount": 58
+       },
+       "overflow": false,
+       "plotOptions": {
+        "customPlotOptions": {},
+        "displayType": "table",
+        "pivotAggregation": null,
+        "pivotColumns": null,
+        "xColumns": null,
+        "yColumns": null
+       },
+       "removedWidgets": [],
+       "schema": [
+        {
+         "metadata": "{}",
+         "name": "path",
+         "type": "\"string\""
+        },
+        {
+         "metadata": "{}",
+         "name": "metrics",
+         "type": "{\"type\":\"struct\",\"fields\":[{\"name\":\"numFilesAdded\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"numFilesRemoved\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"filesAdded\",\"type\":{\"type\":\"struct\",\"fields\":[{\"name\":\"min\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}},{\"name\":\"max\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}},{\"name\":\"avg\",\"type\":\"double\",\"nullable\":false,\"metadata\":{}},{\"name\":\"totalFiles\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"totalSize\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}}]},\"nullable\":true,\"metadata\":{}},{\"name\":\"filesRemoved\",\"type\":{\"type\":\"struct\",\"fields\":[{\"name\":\"min\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}},{\"name\":\"max\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}},{\"name\":\"avg\",\"type\":\"double\",\"nullable\":false,\"metadata\":{}},{\"name\":\"totalFiles\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"totalSize\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}}]},\"nullable\":true,\"metadata\":{}},{\"name\":\"partitionsOptimized\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"zOrderStats\",\"type\":{\"type\":\"struct\",\"fields\":[{\"name\":\"strategyName\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"inputCubeFiles\",\"type\":{\"type\":\"struct\",\"fields\":[{\"name\":\"num\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"size\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}}]},\"nullable\":true,\"metadata\":{}},{\"name\":\"inputOtherFiles\",\"type\":{\"type\":\"struct\",\"fields\":[{\"name\":\"num\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"size\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}}]},\"nullable\":true,\"metadata\":{}},{\"name\":\"inputNumCubes\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"mergedFiles\",\"type\":{\"type\":\"struct\",\"fields\":[{\"name\":\"num\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"size\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}}]},\"nullable\":true,\"metadata\":{}},{\"name\":\"numOutputCubes\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"mergedNumCubes\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}}]},\"nullable\":true,\"metadata\":{}},{\"name\":\"numBatches\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"totalConsideredFiles\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"totalFilesSkipped\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"preserveInsertionOrder\",\"type\":\"boolean\",\"nullable\":false,\"metadata\":{}},{\"name\":\"numFilesSkippedToReduceWriteAmplification\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"numBytesSkippedToReduceWriteAmplification\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"startTimeMs\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"endTimeMs\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"totalClusterParallelism\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"totalScheduledTasks\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"autoCompactParallelismStats\",\"type\":{\"type\":\"struct\",\"fields\":[{\"name\":\"maxClusterActiveParallelism\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}},{\"name\":\"minClusterActiveParallelism\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}},{\"name\":\"maxSessionActiveParallelism\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}},{\"name\":\"minSessionActiveParallelism\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}}]},\"nullable\":true,\"metadata\":{}},{\"name\":\"deletionVectorStats\",\"type\":{\"type\":\"struct\",\"fields\":[{\"name\":\"numDeletionVectorsRemoved\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"numDeletionVectorRowsRemoved\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}}]},\"nullable\":true,\"metadata\":{}},{\"name\":\"numTableColumns\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"numTableColumnsWithStats\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"totalTaskExecutionTimeMs\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"skippedArchivedFiles\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"clusteringMetrics\",\"type\":{\"type\":\"struct\",\"fields\":[{\"name\":\"sizeOfTableInBytesBeforeLazyClustering\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"isNewMetadataCreated\",\"type\":\"boolean\",\"nullable\":false,\"metadata\":{}},{\"name\":\"isPOTriggered\",\"type\":\"boolean\",\"nullable\":false,\"metadata\":{}},{\"name\":\"numFilesSkippedWithoutStats\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"numFilesClassifiedToIntermediateNodes\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"sizeOfFilesClassifiedToIntermediateNodesInBytes\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"logicalSizeOfFilesClassifiedToIntermediateNodesInBytes\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"numFilesClassifiedToLeafNodes\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"sizeOfFilesClassifiedToLeafNodesInBytes\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"logicalSizeOfFilesClassifiedToLeafNodesInBytes\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"numThreadsForClassifier\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"clusterThresholdStrategy\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"minFileSize\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"maxFileSize\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"nodeMinNumFilesToCompact\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"numIdealFiles\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"numClusteringTasksPlanned\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"numCompactionTasksPlanned\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"numOptimizeBatchesPlanned\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"numLeafNodesExpanded\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"numLeafNodesClustered\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"numGetFilesForNodeCalls\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"numSamplingJobs\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"numLeafNodesCompacted\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"numIntermediateNodesCompacted\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"totalSizeOfDataToCompactInBytes\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"totalLogicalSizeOfDataToCompactInBytes\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"numIntermediateNodesClustered\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"numFilesSkippedAfterExpansion\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"totalSizeOfFilesSkippedAfterExpansionInBytes\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"totalLogicalSizeOfFilesSkippedAfterExpansionInBytes\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"totalSizeOfDataToRewriteInBytes\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"totalLogicalSizeOfDataToRewriteInBytes\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"timeMetrics\",\"type\":{\"type\":\"struct\",\"fields\":[{\"name\":\"classifierTimeMs\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"optimizerTimeMs\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"metadataLoadTimeMs\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"totalGetFilesForNodeCallsTimeMs\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"totalSamplingTimeMs\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"metadataCreationTimeMs\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}}]},\"nullable\":true,\"metadata\":{}},{\"name\":\"maxOptimizeBatchesInParallel\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"currentIteration\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"maxIterations\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"clusteringStrategy\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]},\"nullable\":true,\"metadata\":{}}]}"
+        }
+       ],
+       "type": "table"
+      }
+     },
+     "output_type": "display_data"
+    }
+   ],
+   "source": [
+    "%sql\n",
+    "OPTIMIZE default.gold_fact_sales;\n",
+    "OPTIMIZE default.gold_dim_product;\n",
+    "OPTIMIZE default.gold_dim_retailer;"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 0,
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "implicitDf": true,
+      "rowLimit": 10000
+     },
+     "finishTime": 1782210992548,
+     "inputWidgets": {},
+     "nuid": "013fcb98-fb55-4fb9-bf98-b179dd1675a2",
+     "showTitle": false,
+     "startTime": 1782210991240,
+     "submitTime": 1782210990129,
+     "tableResultSettingsMap": {},
+     "title": ""
+    }
+   },
+   "outputs": [
+    {
+     "output_type": "display_data",
+     "data": {
+      "text/html": [
+       "<style scoped>\n",
+       "  .table-result-container {\n",
+       "    max-height: 300px;\n",
+       "    overflow: auto;\n",
+       "  }\n",
+       "  table, th, td {\n",
+       "    border: 1px solid black;\n",
+       "    border-collapse: collapse;\n",
+       "  }\n",
+       "  th, td {\n",
+       "    padding: 5px;\n",
+       "  }\n",
+       "  th {\n",
+       "    text-align: left;\n",
+       "  }\n",
+       "</style><div class='table-result-container'><table class='table-result'><thead style='background-color: white'><tr><th>path</th><th>metrics</th></tr></thead><tbody><tr><td>dbfs:/mnt/gosales/gold/gold_fact_sales</td><td>List(0, 0, List(null, null, 0.0, 0, 0), List(null, null, 0.0, 0, 0), 0, List(minCubeSize(107374182400), List(0, 0), List(1, 20179), 0, List(0, 0), 0, null), 0, 1, 1, false, 0, 0, 1782210991726, 1782210992039, 4, 0, null, List(0, 0), 8, 8, 0, 0, null)</td></tr></tbody></table></div>"
+      ]
+     },
+     "metadata": {
+      "application/vnd.databricks.v1+output": {
+       "addedWidgets": {},
+       "aggData": [],
+       "aggError": "",
+       "aggOverflow": false,
+       "aggSchema": [],
+       "aggSeriesLimitReached": false,
+       "aggType": "",
+       "arguments": {},
+       "columnCustomDisplayInfos": {},
+       "data": [
+        [
+         "dbfs:/mnt/gosales/gold/gold_fact_sales",
+         [
+          0,
+          0,
+          [
+           null,
+           null,
+           0.0,
+           0,
+           0
+          ],
+          [
+           null,
+           null,
+           0.0,
+           0,
+           0
+          ],
+          0,
+          [
+           "minCubeSize(107374182400)",
+           [
+            0,
+            0
+           ],
+           [
+            1,
+            20179
+           ],
+           0,
+           [
+            0,
+            0
+           ],
+           0,
+           null
+          ],
+          0,
+          1,
+          1,
+          false,
+          0,
+          0,
+          1782210991726,
+          1782210992039,
+          4,
+          0,
+          null,
+          [
+           0,
+           0
+          ],
+          8,
+          8,
+          0,
+          0,
+          null
+         ]
+        ]
+       ],
+       "datasetInfos": [],
+       "dbfsResultPath": null,
+       "isJsonSchema": true,
+       "metadata": {
+        "dataframeName": "_sqldf",
+        "executionCount": 60
+       },
+       "overflow": false,
+       "plotOptions": {
+        "customPlotOptions": {},
+        "displayType": "table",
+        "pivotAggregation": null,
+        "pivotColumns": null,
+        "xColumns": null,
+        "yColumns": null
+       },
+       "removedWidgets": [],
+       "schema": [
+        {
+         "metadata": "{}",
+         "name": "path",
+         "type": "\"string\""
+        },
+        {
+         "metadata": "{}",
+         "name": "metrics",
+         "type": "{\"type\":\"struct\",\"fields\":[{\"name\":\"numFilesAdded\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"numFilesRemoved\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"filesAdded\",\"type\":{\"type\":\"struct\",\"fields\":[{\"name\":\"min\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}},{\"name\":\"max\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}},{\"name\":\"avg\",\"type\":\"double\",\"nullable\":false,\"metadata\":{}},{\"name\":\"totalFiles\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"totalSize\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}}]},\"nullable\":true,\"metadata\":{}},{\"name\":\"filesRemoved\",\"type\":{\"type\":\"struct\",\"fields\":[{\"name\":\"min\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}},{\"name\":\"max\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}},{\"name\":\"avg\",\"type\":\"double\",\"nullable\":false,\"metadata\":{}},{\"name\":\"totalFiles\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"totalSize\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}}]},\"nullable\":true,\"metadata\":{}},{\"name\":\"partitionsOptimized\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"zOrderStats\",\"type\":{\"type\":\"struct\",\"fields\":[{\"name\":\"strategyName\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"inputCubeFiles\",\"type\":{\"type\":\"struct\",\"fields\":[{\"name\":\"num\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"size\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}}]},\"nullable\":true,\"metadata\":{}},{\"name\":\"inputOtherFiles\",\"type\":{\"type\":\"struct\",\"fields\":[{\"name\":\"num\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"size\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}}]},\"nullable\":true,\"metadata\":{}},{\"name\":\"inputNumCubes\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"mergedFiles\",\"type\":{\"type\":\"struct\",\"fields\":[{\"name\":\"num\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"size\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}}]},\"nullable\":true,\"metadata\":{}},{\"name\":\"numOutputCubes\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"mergedNumCubes\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}}]},\"nullable\":true,\"metadata\":{}},{\"name\":\"numBatches\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"totalConsideredFiles\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"totalFilesSkipped\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"preserveInsertionOrder\",\"type\":\"boolean\",\"nullable\":false,\"metadata\":{}},{\"name\":\"numFilesSkippedToReduceWriteAmplification\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"numBytesSkippedToReduceWriteAmplification\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"startTimeMs\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"endTimeMs\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"totalClusterParallelism\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"totalScheduledTasks\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"autoCompactParallelismStats\",\"type\":{\"type\":\"struct\",\"fields\":[{\"name\":\"maxClusterActiveParallelism\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}},{\"name\":\"minClusterActiveParallelism\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}},{\"name\":\"maxSessionActiveParallelism\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}},{\"name\":\"minSessionActiveParallelism\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}}]},\"nullable\":true,\"metadata\":{}},{\"name\":\"deletionVectorStats\",\"type\":{\"type\":\"struct\",\"fields\":[{\"name\":\"numDeletionVectorsRemoved\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"numDeletionVectorRowsRemoved\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}}]},\"nullable\":true,\"metadata\":{}},{\"name\":\"numTableColumns\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"numTableColumnsWithStats\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"totalTaskExecutionTimeMs\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"skippedArchivedFiles\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"clusteringMetrics\",\"type\":{\"type\":\"struct\",\"fields\":[{\"name\":\"sizeOfTableInBytesBeforeLazyClustering\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"isNewMetadataCreated\",\"type\":\"boolean\",\"nullable\":false,\"metadata\":{}},{\"name\":\"isPOTriggered\",\"type\":\"boolean\",\"nullable\":false,\"metadata\":{}},{\"name\":\"numFilesSkippedWithoutStats\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"numFilesClassifiedToIntermediateNodes\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"sizeOfFilesClassifiedToIntermediateNodesInBytes\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"logicalSizeOfFilesClassifiedToIntermediateNodesInBytes\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"numFilesClassifiedToLeafNodes\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"sizeOfFilesClassifiedToLeafNodesInBytes\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"logicalSizeOfFilesClassifiedToLeafNodesInBytes\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"numThreadsForClassifier\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"clusterThresholdStrategy\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"minFileSize\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"maxFileSize\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"nodeMinNumFilesToCompact\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"numIdealFiles\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"numClusteringTasksPlanned\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"numCompactionTasksPlanned\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"numOptimizeBatchesPlanned\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"numLeafNodesExpanded\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"numLeafNodesClustered\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"numGetFilesForNodeCalls\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"numSamplingJobs\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"numLeafNodesCompacted\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"numIntermediateNodesCompacted\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"totalSizeOfDataToCompactInBytes\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"totalLogicalSizeOfDataToCompactInBytes\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"numIntermediateNodesClustered\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"numFilesSkippedAfterExpansion\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"totalSizeOfFilesSkippedAfterExpansionInBytes\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"totalLogicalSizeOfFilesSkippedAfterExpansionInBytes\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"totalSizeOfDataToRewriteInBytes\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"totalLogicalSizeOfDataToRewriteInBytes\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"timeMetrics\",\"type\":{\"type\":\"struct\",\"fields\":[{\"name\":\"classifierTimeMs\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"optimizerTimeMs\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"metadataLoadTimeMs\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"totalGetFilesForNodeCallsTimeMs\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"totalSamplingTimeMs\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"metadataCreationTimeMs\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}}]},\"nullable\":true,\"metadata\":{}},{\"name\":\"maxOptimizeBatchesInParallel\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"currentIteration\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"maxIterations\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"clusteringStrategy\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]},\"nullable\":true,\"metadata\":{}}]}"
+        }
+       ],
+       "type": "table"
+      }
+     },
+     "output_type": "display_data"
+    }
+   ],
+   "source": [
+    "%sql\n",
+    "OPTIMIZE gold_fact_sales\n",
+    "ZORDER BY\n",
+    "(\n",
+    "product_key,\n",
+    "retailer_key,\n",
+    "date_key\n",
+    ");"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {},
+     "inputWidgets": {},
+     "nuid": "03bcd856-678e-4532-a766-051b0334a1e4",
+     "showTitle": true,
+     "tableResultSettingsMap": {},
+     "title": "Column Masking"
+    }
+   },
+   "source": [
+    "## 7. Security\n",
+    "\n",
+    "### 7.1 Column Masking (`gold_retailer_masked`)\n",
+    "\n",
+    "Create a secure view that masks `retailer_name` for non-admin users using `is_account_group_member('admin')`."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 0,
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "implicitDf": true,
+      "rowLimit": 10000
+     },
+     "finishTime": 1782207194837,
+     "inputWidgets": {},
+     "nuid": "53a63302-fb56-492a-b367-eba97abcd123",
+     "showTitle": true,
+     "startTime": 1782207193855,
+     "submitTime": 1782207193151,
+     "tableResultSettingsMap": {},
+     "title": "Column Masking View"
+    }
+   },
+   "outputs": [
+    {
+     "output_type": "display_data",
+     "data": {
+      "text/html": [
+       "<style scoped>\n",
+       "  .table-result-container {\n",
+       "    max-height: 300px;\n",
+       "    overflow: auto;\n",
+       "  }\n",
+       "  table, th, td {\n",
+       "    border: 1px solid black;\n",
+       "    border-collapse: collapse;\n",
+       "  }\n",
+       "  th, td {\n",
+       "    padding: 5px;\n",
+       "  }\n",
+       "  th {\n",
+       "    text-align: left;\n",
+       "  }\n",
+       "</style><div class='table-result-container'><table class='table-result'><thead style='background-color: white'><tr></tr></thead><tbody></tbody></table></div>"
+      ]
+     },
+     "metadata": {
+      "application/vnd.databricks.v1+output": {
+       "addedWidgets": {},
+       "aggData": [],
+       "aggError": "",
+       "aggOverflow": false,
+       "aggSchema": [],
+       "aggSeriesLimitReached": false,
+       "aggType": "",
+       "arguments": {},
+       "columnCustomDisplayInfos": {},
+       "data": [],
+       "datasetInfos": [],
+       "dbfsResultPath": null,
+       "isJsonSchema": true,
+       "metadata": {
+        "dataframeName": null
+       },
+       "overflow": false,
+       "plotOptions": {
+        "customPlotOptions": {},
+        "displayType": "table",
+        "pivotAggregation": null,
+        "pivotColumns": null,
+        "xColumns": null,
+        "yColumns": null
+       },
+       "removedWidgets": [],
+       "schema": [],
+       "type": "table"
+      }
+     },
+     "output_type": "display_data"
+    }
+   ],
+   "source": [
+    "%sql\n",
+    "-- Column masking: mask retailer_name for non-admin users\n",
+    "-- Note: is_account_group_member() requires UC; using current_user() pattern instead\n",
+    "CREATE OR REPLACE VIEW gold_retailer_masked AS\n",
+    "\n",
+    "SELECT\n",
+    "\n",
+    "retailer_key,\n",
+    "\n",
+    "CASE\n",
+    "WHEN current_user() LIKE '%admin%'\n",
+    "THEN retailer_name\n",
+    "\n",
+    "ELSE 'MASKED'\n",
+    "END AS retailer_name,\n",
+    "\n",
+    "country\n",
+    "\n",
+    "FROM gold_dim_retailer;"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {},
+     "inputWidgets": {},
+     "nuid": "35f135dd-9d84-407b-9bcb-5a9a0ad4b447",
+     "showTitle": true,
+     "tableResultSettingsMap": {},
+     "title": "Row Level Security"
+    }
+   },
+   "source": [
+    "### 7.2 Row-Level Security (`gold_country_secure`)\n",
+    "\n",
+    "Create a secure view that filters country sales data based on user identity. Users with 'india' in their username see only India data; others see all countries."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 0,
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "implicitDf": true,
+      "rowLimit": 10000
+     },
+     "finishTime": 1782207336603,
+     "inputWidgets": {},
+     "nuid": "9191e4ea-9d42-4551-916a-186f54a683a4",
+     "showTitle": false,
+     "startTime": 1782207335424,
+     "submitTime": 1782207334944,
+     "tableResultSettingsMap": {},
+     "title": ""
+    }
+   },
+   "outputs": [
+    {
+     "output_type": "display_data",
+     "data": {
+      "text/html": [
+       "<style scoped>\n",
+       "  .table-result-container {\n",
+       "    max-height: 300px;\n",
+       "    overflow: auto;\n",
+       "  }\n",
+       "  table, th, td {\n",
+       "    border: 1px solid black;\n",
+       "    border-collapse: collapse;\n",
+       "  }\n",
+       "  th, td {\n",
+       "    padding: 5px;\n",
+       "  }\n",
+       "  th {\n",
+       "    text-align: left;\n",
+       "  }\n",
+       "</style><div class='table-result-container'><table class='table-result'><thead style='background-color: white'><tr></tr></thead><tbody></tbody></table></div>"
+      ]
+     },
+     "metadata": {
+      "application/vnd.databricks.v1+output": {
+       "addedWidgets": {},
+       "aggData": [],
+       "aggError": "",
+       "aggOverflow": false,
+       "aggSchema": [],
+       "aggSeriesLimitReached": false,
+       "aggType": "",
+       "arguments": {},
+       "columnCustomDisplayInfos": {},
+       "data": [],
+       "datasetInfos": [],
+       "dbfsResultPath": null,
+       "isJsonSchema": true,
+       "metadata": {
+        "dataframeName": null
+       },
+       "overflow": false,
+       "plotOptions": {
+        "customPlotOptions": {},
+        "displayType": "table",
+        "pivotAggregation": null,
+        "pivotColumns": null,
+        "xColumns": null,
+        "yColumns": null
+       },
+       "removedWidgets": [],
+       "schema": [],
+       "type": "table"
+      }
+     },
+     "output_type": "display_data"
+    }
+   ],
+   "source": [
+    "%sql\n",
+    "CREATE OR REPLACE VIEW gold_country_secure AS\n",
+    "\n",
+    "SELECT *\n",
+    "\n",
+    "FROM gold_country_sales\n",
+    "\n",
+    "WHERE\n",
+    "\n",
+    "CASE\n",
+    "\n",
+    "WHEN current_user()\n",
+    "LIKE '%india%'\n",
+    "\n",
+    "THEN country='India'\n",
+    "\n",
+    "ELSE TRUE\n",
+    "\n",
+    "END;"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {},
+     "inputWidgets": {},
+     "nuid": "191c9fee-eadb-4b55-8d86-2aa6934641aa",
+     "showTitle": true,
+     "tableResultSettingsMap": {},
+     "title": "Key Business Insights"
+    }
+   },
+   "source": [
+    "## 8. Key Business Insights"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {},
+     "inputWidgets": {},
+     "nuid": "785da9f5-e7a0-4979-a66f-9699a6810018",
+     "showTitle": true,
+     "tableResultSettingsMap": {},
+     "title": "Business Insights Detail"
+    }
+   },
+   "source": [
+    "### Key Metrics\n",
+    "\n",
+    "* **Total Revenue:** $22,432,142.16 across all sales\n",
+    "* **Total Discount Given:** $1,897,797.62 (average discount rate: 6.74%)\n",
+    "* **Total Quantity Sold:** 515,519 units\n",
+    "\n",
+    "### Top Products by Revenue\n",
+    "\n",
+    "* \"Canyon Mule Weekender Backpack\" generated $1.48M\n",
+    "* \"Canyon Mule Journey Backpack\" and \"Star Gazer 2\" each generated over $1M\n",
+    "* High-value golf gear and camping products dominate the top sellers\n",
+    "\n",
+    "### Country Breakdown\n",
+    "\n",
+    "* The United States accounts for the majority of recorded revenue and units in the gold layer output"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {},
+     "inputWidgets": {},
+     "nuid": "bce9b791-bc67-4baa-8fda-455d13ffb8f7",
+     "showTitle": false,
+     "tableResultSettingsMap": {},
+     "title": ""
+    }
+   },
+   "source": []
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {},
+     "inputWidgets": {},
+     "nuid": "98e74053-0f77-42c5-892b-5b54066ca923",
+     "showTitle": false,
+     "tableResultSettingsMap": {},
+     "title": ""
+    }
+   },
+   "source": []
+  }
+ ],
+ "metadata": {
+  "application/vnd.databricks.v1+notebook": {
+   "computePreferences": null,
+   "dashboards": [],
+   "environmentMetadata": {
+    "base_environment": "",
+    "environment_version": "5"
+   },
+   "inputWidgetPreferences": null,
+   "language": "python",
+   "notebookMetadata": {
+    "mostRecentlyExecutedCommandWithImplicitDF": {
+     "commandId": 5500805200049780,
+     "dataframes": [
+      "_sqldf"
+     ]
+    },
+    "pythonIndentUnit": 4
+   },
+   "notebookName": "Gosales_Gold_Final (1)",
+   "widgets": {}
+  },
+  "language_info": {
+   "name": "python"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 0
+}

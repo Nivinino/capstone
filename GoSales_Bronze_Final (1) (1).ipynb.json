@@ -1,0 +1,2134 @@
+{
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {},
+     "inputWidgets": {},
+     "nuid": "6ba38126-a55f-4b5c-a5fe-42847355c0db",
+     "showTitle": true,
+     "tableResultSettingsMap": {},
+     "title": "Notebook Overview"
+    }
+   },
+   "source": [
+    "# Go Sales Data Pipeline - Bronze Layer Ingestion\n",
+    "\n",
+    "This notebook ingests data from the Go Sales Excel file into Delta Lake bronze tables.\n",
+    "\n",
+    "**Data Source:** Azure Data Lake Storage Gen2 (ADLS)  \n",
+    "- **Storage Account:** `datalakedegroup3`  \n",
+    "- **Container:** `gosales`  \n",
+    "- **Path:** `raw/Gosales_Dirty_AllSheets.xlsx`  \n",
+    "- **Origin:** Data integrated from GitHub to ADLS raw folder\n",
+    "\n",
+    "**Output Tables:**\n",
+    "* `bronze_products` - Product catalog with 282 records\n",
+    "* `bronze_order_methods` - Order method types with 12 records\n",
+    "* `bronze_retailers` - Retailer information with 578 records\n",
+    "* `bronze_daily_sales` - Daily sales transactions with 1,030 records\n",
+    "\n",
+    "**Pipeline Version:** v1.0"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {},
+     "inputWidgets": {},
+     "nuid": "4998b4ea-3fbd-4dec-ba39-b9891d717e04",
+     "showTitle": true,
+     "tableResultSettingsMap": {},
+     "title": "Setup Section"
+    }
+   },
+   "source": [
+    "## 1. Setup and Dependencies\n",
+    "\n",
+    "Install required packages and import libraries."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {},
+     "inputWidgets": {},
+     "nuid": "4e52d22f-955a-4a5c-8d71-875e6b627931",
+     "showTitle": true,
+     "tableResultSettingsMap": {},
+     "title": "Install Package"
+    }
+   },
+   "source": [
+    "### Install openpyxl Package\n",
+    "\n",
+    "Install the openpyxl library for reading Excel files and restart Python to load it."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 0,
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "finishTime": 1782208592963,
+     "inputWidgets": {},
+     "nuid": "05bb88c4-a4e4-4e54-8dc1-ac1a28f9e4f7",
+     "showTitle": true,
+     "startTime": 1782208582785,
+     "submitTime": 1782208582274,
+     "tableResultSettingsMap": {},
+     "title": "Install openpyxl"
+    }
+   },
+   "outputs": [
+    {
+     "output_type": "stream",
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "\u001B[43mNote: you may need to restart the kernel using dbutils.library.restartPython() to use updated packages.\u001B[0m\n\u001B[43mNote: you may need to restart the kernel using dbutils.library.restartPython() to use updated packages.\u001B[0m\n"
+     ]
+    }
+   ],
+   "source": [
+    "%pip install openpyxl -q\n",
+    "dbutils.library.restartPython()"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "inputWidgets": {},
+     "nuid": "f0742dac-1a3a-4295-abfb-f89497a2afeb",
+     "showTitle": true,
+     "tableResultSettingsMap": {},
+     "title": "Import Libraries"
+    }
+   },
+   "source": [
+    "### Import Required Libraries\n",
+    "\n",
+    "Import PySpark functions, types, pandas, and IO utilities."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 0,
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "finishTime": 1782208597467,
+     "inputWidgets": {},
+     "nuid": "afd907bc-4775-4234-8daf-b7d6c823bcec",
+     "showTitle": true,
+     "startTime": 1782208595635,
+     "submitTime": 1782208594691,
+     "tableResultSettingsMap": {},
+     "title": "Imports"
+    }
+   },
+   "outputs": [],
+   "source": [
+    "from pyspark.sql.functions import *\n",
+    "from pyspark.sql.types import *\n",
+    "import pandas as pd\n",
+    "import io"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 0,
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "finishTime": 1782208633297,
+     "inputWidgets": {},
+     "nuid": "dcad80e2-641d-431a-bf66-872a4fe2f351",
+     "showTitle": true,
+     "startTime": 1782208633153,
+     "submitTime": 1782208632351,
+     "tableResultSettingsMap": {},
+     "title": "Error Handling Framework"
+    }
+   },
+   "outputs": [],
+   "source": [
+    "# Error handling framework for pipeline resilience\n",
+    "import logging\n",
+    "from datetime import datetime\n",
+    "\n",
+    "# Configure logging\n",
+    "logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')\n",
+    "logger = logging.getLogger(__name__)\n",
+    "\n",
+    "class PipelineError(Exception):\n",
+    "    \"\"\"Custom exception for pipeline failures\"\"\"\n",
+    "    pass\n",
+    "\n",
+    "def safe_read_excel(file_path, sheet_name, schema):\n",
+    "    \"\"\"\n",
+    "    Safely read Excel sheet with error handling.\n",
+    "    Uses Spark binaryFile reader for ADLS/mount path compatibility.\n",
+    "    \n",
+    "    Args:\n",
+    "        file_path: Path to Excel file (supports ADLS mount paths, ABFSS, DBFS)\n",
+    "        sheet_name: Name of sheet to read\n",
+    "        schema: PySpark schema for the data\n",
+    "    \n",
+    "    Returns:\n",
+    "        DataFrame or None if failed\n",
+    "    \"\"\"\n",
+    "    try:\n",
+    "        logger.info(f\"Reading sheet '{sheet_name}' from {file_path}\")\n",
+    "        \n",
+    "        # Read binary file using Spark (works with ADLS mounts and ABFSS paths)\n",
+    "        file_df = spark.read.format(\"binaryFile\").load(file_path)\n",
+    "        file_content = file_df.collect()[0][\"content\"]\n",
+    "        \n",
+    "        # Convert to pandas\n",
+    "        pdf = pd.read_excel(io.BytesIO(bytes(file_content)), sheet_name=sheet_name)\n",
+    "        \n",
+    "        # Convert to Spark DataFrame\n",
+    "        df = spark.createDataFrame(pdf, schema=schema)\n",
+    "        \n",
+    "        logger.info(f\"Successfully read {df.count()} records from '{sheet_name}'\")\n",
+    "        return df\n",
+    "        \n",
+    "    except Exception as e:\n",
+    "        if \"Path does not exist\" in str(e) or \"FileNotFoundException\" in str(e):\n",
+    "            logger.error(f\"File not found: {file_path}\")\n",
+    "            raise PipelineError(f\"Source file not found: {file_path}\")\n",
+    "        elif \"ValueError\" in str(type(e).__name__):\n",
+    "            logger.error(f\"Schema mismatch in sheet '{sheet_name}': {str(e)}\")\n",
+    "            raise PipelineError(f\"Data validation error in '{sheet_name}': {str(e)}\")\n",
+    "        else:\n",
+    "            logger.error(f\"Unexpected error reading '{sheet_name}': {str(e)}\")\n",
+    "            raise PipelineError(f\"Failed to read '{sheet_name}': {str(e)}\")\n",
+    "\n",
+    "def safe_write_table(df, table_name, mode=\"overwrite\", partition_by=None):\n",
+    "    \"\"\"\n",
+    "    Safely write DataFrame to Delta table with error handling\n",
+    "    \n",
+    "    Args:\n",
+    "        df: DataFrame to write\n",
+    "        table_name: Fully qualified table name\n",
+    "        mode: Write mode (overwrite, append)\n",
+    "        partition_by: Column(s) to partition by\n",
+    "    \"\"\"\n",
+    "    try:\n",
+    "        logger.info(f\"Writing {df.count()} records to {table_name}\")\n",
+    "        \n",
+    "        writer = df.write.format(\"delta\").mode(mode).option(\"overwriteSchema\", \"true\")\n",
+    "        \n",
+    "        if partition_by:\n",
+    "            writer = writer.partitionBy(partition_by)\n",
+    "        \n",
+    "        writer.saveAsTable(table_name)\n",
+    "        \n",
+    "        logger.info(f\"Successfully wrote to {table_name}\")\n",
+    "        \n",
+    "    except Exception as e:\n",
+    "        logger.error(f\"Failed to write to {table_name}: {str(e)}\")\n",
+    "        raise PipelineError(f\"Write operation failed for {table_name}: {str(e)}\")\n",
+    "\n",
+    "logger.info(\"Error handling framework initialized\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "inputWidgets": {},
+     "nuid": "2c48c193-422a-4170-b985-e5b1d85922d3",
+     "showTitle": true,
+     "tableResultSettingsMap": {},
+     "title": "ADLS Mount Section"
+    }
+   },
+   "source": [
+    "## 2. Mount Azure Data Lake Storage (ADLS Gen2)\n",
+    "\n",
+    "Mount the storage account `datalakedegroup3`, container `gosales` using the access key.  \n",
+    "**Note:** `dbutils.fs.mount` is required because this cluster uses credential passthrough, which ignores `spark.conf.set` for storage keys."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 0,
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "finishTime": 1782208639102,
+     "inputWidgets": {},
+     "nuid": "6107930a-f2a3-48fa-a9a0-ef743dcf2023",
+     "showTitle": true,
+     "startTime": 1782208638794,
+     "submitTime": 1782208638291,
+     "tableResultSettingsMap": {},
+     "title": "Mount ADLS"
+    }
+   },
+   "outputs": [
+    {
+     "output_type": "stream",
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Already mounted at /mnt/gosales\n\n   Mount point: /mnt/gosales\n   Storage: datalakedegroup3/gosales\n"
+     ]
+    }
+   ],
+   "source": [
+    "# ============================================================\n",
+    "# ADLS Gen2 Mount Configuration\n",
+    "# Storage Account: datalakedegroup3\n",
+    "# Container: gosales\n",
+    "# Auth: Storage Account Access Key (via mount)\n",
+    "# Note: spark.conf.set does NOT work with credential passthrough\n",
+    "#       clusters. Mount stores its own credentials separately.\n",
+    "# ============================================================\n",
+    "\n",
+    "storage_account_name = \"datalakedegroup3\"\n",
+    "container_name = \"gosales\"\n",
+    "mount_point = \"/mnt/gosales\"\n",
+    "\n",
+    "# Storage Account Access Key\n",
+    "access_key = \"+vqXMJQnGtssWe2GAQi0UDEgdz2PvUzhRk4tqi/jCViVF4y0qQoFOnB71p6KMT6DySDv5PxH+R6++AStbxnIMg==\"\n",
+    "\n",
+    "# Check if already mounted, unmount if needed to refresh credentials\n",
+    "if any(mount.mountPoint == mount_point for mount in dbutils.fs.mounts()):\n",
+    "    print(f\"Already mounted at {mount_point}\")\n",
+    "else:\n",
+    "    dbutils.fs.mount(\n",
+    "        source=f\"wasbs://{container_name}@{storage_account_name}.blob.core.windows.net\",\n",
+    "        mount_point=mount_point,\n",
+    "        extra_configs={\n",
+    "            f\"fs.azure.account.key.{storage_account_name}.blob.core.windows.net\": access_key\n",
+    "        }\n",
+    "    )\n",
+    "    print(f\"✅ Successfully mounted at {mount_point}\")\n",
+    "\n",
+    "print(f\"\\n   Mount point: {mount_point}\")\n",
+    "print(f\"   Storage: {storage_account_name}/{container_name}\")"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 0,
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "finishTime": 1782208641104,
+     "inputWidgets": {},
+     "nuid": "148a5d54-0019-46f9-925d-60c02afcd371",
+     "showTitle": true,
+     "startTime": 1782208640920,
+     "submitTime": 1782208640541,
+     "tableResultSettingsMap": {},
+     "title": "Verify Raw Folder"
+    }
+   },
+   "outputs": [
+    {
+     "output_type": "stream",
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "--- Contents of /mnt/gosales/raw/ ---\n  ✅ Gosales_Dirty_AllSheets.xlsx (95347 bytes)\n\n✅ Successfully connected! Found 1 file(s).\n"
+     ]
+    }
+   ],
+   "source": [
+    "# Verify mount by listing raw folder\n",
+    "print(f\"--- Contents of {mount_point}/raw/ ---\")\n",
+    "try:\n",
+    "    raw_files = dbutils.fs.ls(f\"{mount_point}/raw/\")\n",
+    "    for f in raw_files:\n",
+    "        print(f\"  ✅ {f.name} ({f.size} bytes)\")\n",
+    "    print(f\"\\n✅ Successfully connected! Found {len(raw_files)} file(s).\")\n",
+    "except Exception as e:\n",
+    "    print(f\"❌ Error: {e}\")\n",
+    "    print(\"\\nIf 'raw' folder not found, ensure ADF has copied the file from GitHub to ADLS.\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "inputWidgets": {},
+     "nuid": "2efc90cb-7086-4f25-a259-8eaaa15ab41f",
+     "showTitle": true,
+     "tableResultSettingsMap": {},
+     "title": "Configuration Section"
+    }
+   },
+   "source": [
+    "## 3. Configuration Parameters\n",
+    "\n",
+    "Define widgets for ADLS mount path, catalog, and schema. These can be modified at runtime."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "inputWidgets": {},
+     "nuid": "199a608b-7faf-4390-a0ce-9ad5558f7869",
+     "showTitle": true,
+     "tableResultSettingsMap": {},
+     "title": "Define Parameters"
+    }
+   },
+   "source": [
+    "### Define Configuration Widgets\n",
+    "\n",
+    "Create text widgets for ADLS mount path (`/mnt/gosales`), catalog, and schema parameters."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 0,
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "finishTime": 1782208643181,
+     "inputWidgets": {},
+     "nuid": "74fc824c-c007-4e28-9f9d-6c28afd4f63b",
+     "showTitle": true,
+     "startTime": 1782208643048,
+     "submitTime": 1782208642435,
+     "tableResultSettingsMap": {},
+     "title": "Configuration Widgets"
+    }
+   },
+   "outputs": [
+    {
+     "output_type": "stream",
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Source file path: /mnt/gosales/raw/Gosales_Dirty_AllSheets.xlsx\nTarget schema: default\n"
+     ]
+    }
+   ],
+   "source": [
+    "dbutils.widgets.text(\"source_path\", \"/mnt/gosales\")\n",
+    "dbutils.widgets.text(\"schema\", \"default\")\n",
+    "\n",
+    "source_path = dbutils.widgets.get(\"source_path\")\n",
+    "schema = dbutils.widgets.get(\"schema\")\n",
+    "\n",
+    "# Use schema-only table references (no catalog - UC not enabled on this cluster)\n",
+    "# Source file from ADLS mount (datalakedegroup3/gosales/raw/)\n",
+    "source_file = f\"{source_path}/raw/Gosales_Dirty_AllSheets.xlsx\"\n",
+    "print(f\"Source file path: {source_file}\")\n",
+    "print(f\"Target schema: {schema}\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "inputWidgets": {},
+     "nuid": "5260e4a4-d78b-4a77-a633-e3eec6f9f306",
+     "showTitle": true,
+     "tableResultSettingsMap": {},
+     "title": "Data Loading Section"
+    }
+   },
+   "source": [
+    "## 4. Load Excel File\n",
+    "\n",
+    "Read the Excel file from ADLS mount (`/mnt/gosales/raw/`) using Spark binaryFile reader."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 0,
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "finishTime": 1782208646084,
+     "inputWidgets": {},
+     "nuid": "5efa45e9-fa75-4662-8c01-43ea33249eb1",
+     "showTitle": true,
+     "startTime": 1782208645354,
+     "submitTime": 1782208644838,
+     "tableResultSettingsMap": {},
+     "title": "Load Excel File"
+    }
+   },
+   "outputs": [
+    {
+     "output_type": "stream",
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "['Products', 'Methods ', 'Dailysales', 'Retail', '1k']\n"
+     ]
+    }
+   ],
+   "source": [
+    "file_df = spark.read.format(\"binaryFile\").load(source_file)\n",
+    "\n",
+    "file_content = file_df.collect()[0][\"content\"]\n",
+    "\n",
+    "excel_file = pd.ExcelFile(\n",
+    "    io.BytesIO(bytes(file_content))\n",
+    ")\n",
+    "\n",
+    "print(excel_file.sheet_names)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "inputWidgets": {},
+     "nuid": "9d49e7cb-d7a4-4082-8cd8-fceb2559848b",
+     "showTitle": true,
+     "tableResultSettingsMap": {},
+     "title": "Helper Functions Section"
+    }
+   },
+   "source": [
+    "## 5. Helper Functions\n",
+    "\n",
+    "Define reusable functions for adding metadata and profiling null values."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "inputWidgets": {},
+     "nuid": "dd4e67f7-f2a3-4200-8de5-852a4fb6cf3b",
+     "showTitle": true,
+     "tableResultSettingsMap": {},
+     "title": "Metadata Function"
+    }
+   },
+   "source": [
+    "### Add Metadata Function\n",
+    "\n",
+    "Helper function to add ingestion timestamp, source file, processing date, and pipeline version to DataFrames."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 0,
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "finishTime": 1782208648187,
+     "inputWidgets": {},
+     "nuid": "943d636d-f334-421c-b0f7-60eca1f108ad",
+     "showTitle": true,
+     "startTime": 1782208648081,
+     "submitTime": 1782208647691,
+     "tableResultSettingsMap": {},
+     "title": "Add Metadata Function"
+    }
+   },
+   "outputs": [],
+   "source": [
+    "def add_metadata(df, source_name):\n",
+    "\n",
+    "    return (\n",
+    "        df\n",
+    "        .withColumn(\"ingested_at\", current_timestamp())\n",
+    "        .withColumn(\"source_file\", lit(source_name))\n",
+    "        .withColumn(\"processing_date\", current_date())\n",
+    "        .withColumn(\"pipeline_version\", lit(\"v1.0\"))\n",
+    "    )"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "inputWidgets": {},
+     "nuid": "0f7d8a5e-17b6-451f-a1fa-27f5031cd99f",
+     "showTitle": true,
+     "tableResultSettingsMap": {},
+     "title": "Null Profiling"
+    }
+   },
+   "source": [
+    "### Null Profiling Function\n",
+    "\n",
+    "Helper function to count null values in each column for data quality assessment."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 0,
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "finishTime": 1782208650594,
+     "inputWidgets": {},
+     "nuid": "fca8e3f9-5855-4a13-92cb-220aa56fbcfc",
+     "showTitle": true,
+     "startTime": 1782208650461,
+     "submitTime": 1782208649915,
+     "tableResultSettingsMap": {},
+     "title": "Profile Nulls Function"
+    }
+   },
+   "outputs": [],
+   "source": [
+    "def profile_nulls(df, table_name):\n",
+    "\n",
+    "    total_rows = df.count()\n",
+    "\n",
+    "    print(f\"\\n===== NULL PROFILE : {table_name} =====\")\n",
+    "\n",
+    "    for c in df.columns:\n",
+    "\n",
+    "        null_count = df.filter(\n",
+    "            col(c).isNull()\n",
+    "        ).count()\n",
+    "\n",
+    "        print(\n",
+    "            f\"{c}: {null_count}\"\n",
+    "        )"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "inputWidgets": {},
+     "nuid": "ab77eba1-877c-4c0e-be74-e3060044cbd6",
+     "showTitle": true,
+     "tableResultSettingsMap": {},
+     "title": "Products Processing Section"
+    }
+   },
+   "source": [
+    "## 6. Products Data Processing\n",
+    "\n",
+    "**Sheet:** Products  \n",
+    "**Expected Records:** 282\n",
+    "\n",
+    "**Note:** Product_number contains alphanumeric values (e.g., \"A11110\") and is stored as string type."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "inputWidgets": {},
+     "nuid": "cba71a46-82b4-487f-8b01-4c6426e3f7c9",
+     "showTitle": true,
+     "tableResultSettingsMap": {},
+     "title": "Products Schema"
+    }
+   },
+   "source": [
+    "### Define Products Schema\n",
+    "\n",
+    "Define the schema for the Products table with string type for Product_number to handle alphanumeric values."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 0,
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "finishTime": 1782208652495,
+     "inputWidgets": {},
+     "nuid": "6633cc67-9cd5-41e1-8915-ff824dd1e10d",
+     "showTitle": true,
+     "startTime": 1782208652371,
+     "submitTime": 1782208651976,
+     "tableResultSettingsMap": {},
+     "title": "Products Schema"
+    }
+   },
+   "outputs": [],
+   "source": [
+    "products_schema = StructType([\n",
+    "    StructField(\"Product_number\", StringType(), True),\n",
+    "    StructField(\"Product_line\", StringType(), True),\n",
+    "    StructField(\"Product_type\", StringType(), True),\n",
+    "    StructField(\"Product\", StringType(), True),\n",
+    "    StructField(\"Product_brand\", StringType(), True),\n",
+    "    StructField(\"Product_color\", StringType(), True),\n",
+    "    StructField(\"Unit_cost\", DoubleType(), True),\n",
+    "    StructField(\"Unit_price\", DoubleType(), True)\n",
+    "])"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "inputWidgets": {},
+     "nuid": "ddaf8989-a73a-4316-a3e8-311410bdff7f",
+     "showTitle": true,
+     "tableResultSettingsMap": {},
+     "title": "Load Products"
+    }
+   },
+   "source": [
+    "### Load Products Sheet\n",
+    "\n",
+    "Read the Products sheet from Excel, clean column names, and convert to Spark DataFrame."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 0,
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "finishTime": 1782208654998,
+     "inputWidgets": {},
+     "nuid": "09a396b0-653e-488c-99a8-d0e7e193d2ed",
+     "showTitle": true,
+     "startTime": 1782208654718,
+     "submitTime": 1782208654242,
+     "tableResultSettingsMap": {},
+     "title": "Load Products"
+    }
+   },
+   "outputs": [],
+   "source": [
+    "products_pdf = pd.read_excel(\n",
+    "    excel_file,\n",
+    "    sheet_name=\"Products\"\n",
+    ")\n",
+    "\n",
+    "products_pdf.columns = [\n",
+    "    c.replace(\" \", \"_\")\n",
+    "    for c in products_pdf.columns\n",
+    "]\n",
+    "\n",
+    "products_pdf['Product_number'] = products_pdf['Product_number'].astype(str)\n",
+    "\n",
+    "products_df = spark.createDataFrame(\n",
+    "    products_pdf,\n",
+    "    schema=products_schema\n",
+    ")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "inputWidgets": {},
+     "nuid": "a3ee1c54-bc88-4dcb-abb8-1d49282fdd9b",
+     "showTitle": true,
+     "tableResultSettingsMap": {},
+     "title": "Products Metadata"
+    }
+   },
+   "source": [
+    "### Add Metadata to Products\n",
+    "\n",
+    "Add ingestion metadata columns to the Products DataFrame."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 0,
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "finishTime": 1782208657100,
+     "inputWidgets": {},
+     "nuid": "04daac41-5cfc-4cb3-963c-594ea0afc4f2",
+     "showTitle": true,
+     "startTime": 1782208657001,
+     "submitTime": 1782208656542,
+     "tableResultSettingsMap": {},
+     "title": "Add Metadata to Products"
+    }
+   },
+   "outputs": [],
+   "source": [
+    "products_df = add_metadata(\n",
+    "    products_df,\n",
+    "    \"Products\"\n",
+    ")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "inputWidgets": {},
+     "nuid": "3b7fa4bf-f6eb-4e49-9745-1297b90e6894",
+     "showTitle": true,
+     "tableResultSettingsMap": {},
+     "title": "Profile Products"
+    }
+   },
+   "source": [
+    "### Profile Products Null Values\n",
+    "\n",
+    "Run null value profiling on Products DataFrame to identify data quality issues."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 0,
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "finishTime": 1782208661715,
+     "inputWidgets": {},
+     "nuid": "224cca74-d93d-49e9-ac11-bc518a61305c",
+     "showTitle": true,
+     "startTime": 1782208659133,
+     "submitTime": 1782208658584,
+     "tableResultSettingsMap": {},
+     "title": "Profile Products"
+    }
+   },
+   "outputs": [
+    {
+     "output_type": "stream",
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "\n===== NULL PROFILE : Products =====\nProduct_number: 0\nProduct_line: 0\nProduct_type: 0\nProduct: 0\nProduct_brand: 0\nProduct_color: 0\nUnit_cost: 0\nUnit_price: 0\ningested_at: 0\nsource_file: 0\nprocessing_date: 0\npipeline_version: 0\n"
+     ]
+    }
+   ],
+   "source": [
+    "profile_nulls(\n",
+    "    products_df,\n",
+    "    \"Products\"\n",
+    ")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "inputWidgets": {},
+     "nuid": "ad7bc0a5-c7de-4e25-aa15-d506dafad20e",
+     "showTitle": true,
+     "tableResultSettingsMap": {},
+     "title": "Write Products"
+    }
+   },
+   "source": [
+    "### Write Products to Bronze Table\n",
+    "\n",
+    "Deduplicate on `Product_number`, then create or merge-upsert into `bronze_products` Delta table. Uses DeltaTable MERGE for incremental loads."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 0,
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "finishTime": 1782208678733,
+     "inputWidgets": {},
+     "nuid": "9960d375-aba3-4ad3-8db1-fd2e1641d6e9",
+     "showTitle": true,
+     "startTime": 1782208673642,
+     "submitTime": 1782208673018,
+     "tableResultSettingsMap": {},
+     "title": "Write Products"
+    }
+   },
+   "outputs": [
+    {
+     "output_type": "stream",
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Table created at: /mnt/gosales/bronze/bronze_products\n"
+     ]
+    }
+   ],
+   "source": [
+    "from delta.tables import DeltaTable\n",
+    "\n",
+    "# ADLS path for bronze layer\n",
+    "bronze_path = f\"{source_path}/bronze\"\n",
+    "\n",
+    "# Deduplicate source data to avoid merge conflicts\n",
+    "products_df_dedup = products_df.dropDuplicates([\"Product_number\"])\n",
+    "\n",
+    "# Write to ADLS container with external table registration\n",
+    "table_path = f\"{bronze_path}/bronze_products\"\n",
+    "\n",
+    "if not spark.catalog.tableExists(f\"{schema}.bronze_products\"):\n",
+    "    products_df_dedup.write \\\n",
+    "        .format(\"delta\") \\\n",
+    "        .mode(\"overwrite\") \\\n",
+    "        .option(\"overwriteSchema\", \"true\") \\\n",
+    "        .option(\"path\", table_path) \\\n",
+    "        .saveAsTable(f\"{schema}.bronze_products\")\n",
+    "    print(f\"Table created at: {table_path}\")\n",
+    "else:\n",
+    "    # Merge upsert\n",
+    "    delta_table = DeltaTable.forName(spark, f\"{schema}.bronze_products\")\n",
+    "    \n",
+    "    delta_table.alias(\"target\").merge(\n",
+    "        products_df_dedup.alias(\"source\"),\n",
+    "        \"target.Product_number = source.Product_number\"\n",
+    "    ).whenMatchedUpdateAll(\n",
+    "    ).whenNotMatchedInsertAll(\n",
+    "    ).execute()\n",
+    "    \n",
+    "    print(\"Merge upsert completed\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "inputWidgets": {},
+     "nuid": "5b7f8d45-2c10-4f88-86db-10f2b1cddfac",
+     "showTitle": true,
+     "tableResultSettingsMap": {},
+     "title": "Methods Section"
+    }
+   },
+   "source": [
+    "## 7. Order Methods Data Processing\n",
+    "\n",
+    "**Sheet:** Methods  \n",
+    "**Expected Records:** 12"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "inputWidgets": {},
+     "nuid": "8a74b3de-dadf-4002-b29a-3c047c033e1f",
+     "showTitle": true,
+     "tableResultSettingsMap": {},
+     "title": "Methods Schema"
+    }
+   },
+   "source": [
+    "### Define Order Methods Schema\n",
+    "\n",
+    "Define the schema for the Order Methods table."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 0,
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "finishTime": 1782208681136,
+     "inputWidgets": {},
+     "nuid": "363d9337-1d8c-4486-ac84-40fa528ea1cf",
+     "showTitle": true,
+     "startTime": 1782208680992,
+     "submitTime": 1782208680597,
+     "tableResultSettingsMap": {},
+     "title": "Methods Schema"
+    }
+   },
+   "outputs": [],
+   "source": [
+    "methods_schema = StructType([\n",
+    "    StructField(\"Order_method_code\", IntegerType(), True),\n",
+    "    StructField(\"Order_method_type\", StringType(), True)\n",
+    "])"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "inputWidgets": {},
+     "nuid": "44ab04b4-8f54-40f7-a608-5d274619b8f0",
+     "showTitle": true,
+     "tableResultSettingsMap": {},
+     "title": "Load Methods"
+    }
+   },
+   "source": [
+    "### Load Methods Sheet\n",
+    "\n",
+    "Read the Methods sheet from Excel, clean column names, and convert to Spark DataFrame."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 0,
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "finishTime": 1782208683638,
+     "inputWidgets": {},
+     "nuid": "f9fd9579-d404-4d97-a4ee-ceaf9a4cba99",
+     "showTitle": true,
+     "startTime": 1782208683481,
+     "submitTime": 1782208683026,
+     "tableResultSettingsMap": {},
+     "title": "Load Methods"
+    }
+   },
+   "outputs": [],
+   "source": [
+    "methods_pdf = pd.read_excel(\n",
+    "    excel_file,\n",
+    "    sheet_name=\"Methods \"\n",
+    ")\n",
+    "\n",
+    "methods_pdf.columns = [\n",
+    "    c.replace(\" \", \"_\")\n",
+    "    for c in methods_pdf.columns\n",
+    "]\n",
+    "\n",
+    "methods_df = spark.createDataFrame(\n",
+    "    methods_pdf,\n",
+    "    schema=methods_schema\n",
+    ")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "inputWidgets": {},
+     "nuid": "31ad1e53-b011-4362-aabd-9df7e87c0271",
+     "showTitle": true,
+     "tableResultSettingsMap": {},
+     "title": "Methods Metadata"
+    }
+   },
+   "source": [
+    "### Add Metadata to Methods\n",
+    "\n",
+    "Add ingestion metadata columns to the Methods DataFrame."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 0,
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "finishTime": 1782208685742,
+     "inputWidgets": {},
+     "nuid": "31b3fe88-9b05-4d99-bd8f-9513de9eb4b0",
+     "showTitle": true,
+     "startTime": 1782208685576,
+     "submitTime": 1782208685168,
+     "tableResultSettingsMap": {},
+     "title": "Add Metadata to Methods"
+    }
+   },
+   "outputs": [],
+   "source": [
+    "methods_df = add_metadata(\n",
+    "    methods_df,\n",
+    "    \"Methods\"\n",
+    ")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "inputWidgets": {},
+     "nuid": "8c2cdf35-6d71-4eb9-a018-8faf0580d34d",
+     "showTitle": true,
+     "tableResultSettingsMap": {},
+     "title": "Profile Methods"
+    }
+   },
+   "source": [
+    "### Profile Methods Null Values\n",
+    "\n",
+    "Run null value profiling on Methods DataFrame."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 0,
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "finishTime": 1782208689046,
+     "inputWidgets": {},
+     "nuid": "d7c1f3a4-7bd6-4ec2-ab59-8a90132e2883",
+     "showTitle": true,
+     "startTime": 1782208687951,
+     "submitTime": 1782208687395,
+     "tableResultSettingsMap": {},
+     "title": "Profile Methods"
+    }
+   },
+   "outputs": [
+    {
+     "output_type": "stream",
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "\n===== NULL PROFILE : Methods =====\nOrder_method_code: 0\nOrder_method_type: 0\ningested_at: 0\nsource_file: 0\nprocessing_date: 0\npipeline_version: 0\n"
+     ]
+    }
+   ],
+   "source": [
+    "profile_nulls(\n",
+    "    methods_df,\n",
+    "    \"Methods\"\n",
+    ")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "inputWidgets": {},
+     "nuid": "02e68e31-8411-464f-997f-ee51105ec646",
+     "showTitle": true,
+     "tableResultSettingsMap": {},
+     "title": "Write Methods"
+    }
+   },
+   "source": [
+    "### Write Methods to Bronze Table\n",
+    "\n",
+    "Create or merge-upsert into `bronze_order_methods` Delta table on `Order_method_code` key."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 0,
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "finishTime": 1782208695651,
+     "inputWidgets": {},
+     "nuid": "e248e6bb-baf3-4e2a-a412-8055f965b939",
+     "showTitle": true,
+     "startTime": 1782208691517,
+     "submitTime": 1782208690924,
+     "tableResultSettingsMap": {},
+     "title": "Write Methods"
+    }
+   },
+   "outputs": [
+    {
+     "output_type": "stream",
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Table created at: /mnt/gosales/bronze/bronze_order_methods\n"
+     ]
+    }
+   ],
+   "source": [
+    "# Write to ADLS container\n",
+    "table_path = f\"{bronze_path}/bronze_order_methods\"\n",
+    "\n",
+    "if not spark.catalog.tableExists(f\"{schema}.bronze_order_methods\"):\n",
+    "    methods_df.write \\\n",
+    "        .format(\"delta\") \\\n",
+    "        .mode(\"overwrite\") \\\n",
+    "        .option(\"overwriteSchema\", \"true\") \\\n",
+    "        .option(\"path\", table_path) \\\n",
+    "        .saveAsTable(f\"{schema}.bronze_order_methods\")\n",
+    "    print(f\"Table created at: {table_path}\")\n",
+    "else:\n",
+    "    # Merge upsert\n",
+    "    delta_table = DeltaTable.forName(spark, f\"{schema}.bronze_order_methods\")\n",
+    "    \n",
+    "    delta_table.alias(\"target\").merge(\n",
+    "        methods_df.alias(\"source\"),\n",
+    "        \"target.Order_method_code = source.Order_method_code\"\n",
+    "    ).whenMatchedUpdateAll(\n",
+    "    ).whenNotMatchedInsertAll(\n",
+    "    ).execute()\n",
+    "    \n",
+    "    print(\"Merge upsert completed\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "inputWidgets": {},
+     "nuid": "0dfdf2e7-e0c6-4f97-b28e-4ca5415003df",
+     "showTitle": true,
+     "tableResultSettingsMap": {},
+     "title": "Retailers Section"
+    }
+   },
+   "source": [
+    "## 8. Retailers Data Processing\n",
+    "\n",
+    "**Sheet:** Retail  \n",
+    "**Expected Records:** 578"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "inputWidgets": {},
+     "nuid": "dea1cfc5-0804-42ce-b647-b438bdb9fe3d",
+     "showTitle": true,
+     "tableResultSettingsMap": {},
+     "title": "Retailers Schema"
+    }
+   },
+   "source": [
+    "### Define Retailers Schema\n",
+    "\n",
+    "Define the schema for the Retailers table."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 0,
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "finishTime": 1782208698053,
+     "inputWidgets": {},
+     "nuid": "4e3d0b8a-ae9c-435f-b378-e06f1ebbbaca",
+     "showTitle": true,
+     "startTime": 1782208697956,
+     "submitTime": 1782208697262,
+     "tableResultSettingsMap": {},
+     "title": "Retailers Schema"
+    }
+   },
+   "outputs": [],
+   "source": [
+    "retailers_schema = StructType([\n",
+    "    StructField(\"Retailer_code\", IntegerType(), True),\n",
+    "    StructField(\"Retailer_name\", StringType(), True),\n",
+    "    StructField(\"Type\", StringType(), True),\n",
+    "    StructField(\"Country\", StringType(), True)\n",
+    "])"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "inputWidgets": {},
+     "nuid": "11d46945-2233-411f-afe2-6625def948f7",
+     "showTitle": true,
+     "tableResultSettingsMap": {},
+     "title": "Load Retailers"
+    }
+   },
+   "source": [
+    "### Load Retailers Sheet\n",
+    "\n",
+    "Read the Retail sheet from Excel, clean column names, and convert to Spark DataFrame."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 0,
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "finishTime": 1782208700255,
+     "inputWidgets": {},
+     "nuid": "3e6a2236-48fc-4d95-ba1e-9215bac32e1d",
+     "showTitle": true,
+     "startTime": 1782208700085,
+     "submitTime": 1782208699647,
+     "tableResultSettingsMap": {},
+     "title": "Load Retailers"
+    }
+   },
+   "outputs": [],
+   "source": [
+    "retailers_pdf = pd.read_excel(\n",
+    "    excel_file,\n",
+    "    sheet_name=\"Retail\"\n",
+    ")\n",
+    "\n",
+    "retailers_pdf.columns = [\n",
+    "    c.replace(\" \", \"_\")\n",
+    "    for c in retailers_pdf.columns\n",
+    "]\n",
+    "\n",
+    "retailers_df = spark.createDataFrame(\n",
+    "    retailers_pdf,\n",
+    "    schema=retailers_schema\n",
+    ")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "inputWidgets": {},
+     "nuid": "07b85583-53fd-4dd9-ac8d-da892083364c",
+     "showTitle": true,
+     "tableResultSettingsMap": {},
+     "title": "Retailers Metadata"
+    }
+   },
+   "source": [
+    "### Add Metadata to Retailers\n",
+    "\n",
+    "Add ingestion metadata columns to the Retailers DataFrame."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 0,
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "finishTime": 1782208702758,
+     "inputWidgets": {},
+     "nuid": "e938f87c-8a12-47c0-aba3-cf4fa8df4163",
+     "showTitle": true,
+     "startTime": 1782208702585,
+     "submitTime": 1782208701863,
+     "tableResultSettingsMap": {},
+     "title": "Add Metadata to Retailers"
+    }
+   },
+   "outputs": [],
+   "source": [
+    "retailers_df = add_metadata(\n",
+    "    retailers_df,\n",
+    "    \"Retail\"\n",
+    ")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "inputWidgets": {},
+     "nuid": "568bdd62-269c-4cd8-84bb-79ad02c518ba",
+     "showTitle": true,
+     "tableResultSettingsMap": {},
+     "title": "Profile Retailers"
+    }
+   },
+   "source": [
+    "### Profile Retailers Null Values\n",
+    "\n",
+    "Run null value profiling on Retailers DataFrame."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 0,
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "finishTime": 1782208706577,
+     "inputWidgets": {},
+     "nuid": "70239398-75b6-4762-b15f-e2a73368a11e",
+     "showTitle": true,
+     "startTime": 1782208704963,
+     "submitTime": 1782208704375,
+     "tableResultSettingsMap": {},
+     "title": "Profile Retailers"
+    }
+   },
+   "outputs": [
+    {
+     "output_type": "stream",
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "\n===== NULL PROFILE : Retailers =====\nRetailer_code: 0\nRetailer_name: 0\nType: 0\nCountry: 0\ningested_at: 0\nsource_file: 0\nprocessing_date: 0\npipeline_version: 0\n"
+     ]
+    }
+   ],
+   "source": [
+    "profile_nulls(\n",
+    "    retailers_df,\n",
+    "    \"Retailers\"\n",
+    ")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "inputWidgets": {},
+     "nuid": "725c88a9-257a-4493-b70a-ffc8d7f7db35",
+     "showTitle": true,
+     "tableResultSettingsMap": {},
+     "title": "Write Retailers"
+    }
+   },
+   "source": [
+    "### Write Retailers to Bronze Table\n",
+    "\n",
+    "Deduplicate on `Retailer_code`, then create or merge-upsert into `bronze_retailers` Delta table."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 0,
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "finishTime": 1782208717887,
+     "inputWidgets": {},
+     "nuid": "37887158-06ee-4bb9-8ed3-6effffb892b5",
+     "showTitle": true,
+     "startTime": 1782208712835,
+     "submitTime": 1782208712306,
+     "tableResultSettingsMap": {},
+     "title": "Write Retailers"
+    }
+   },
+   "outputs": [
+    {
+     "output_type": "stream",
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Table created at: /mnt/gosales/bronze/bronze_retailers\n"
+     ]
+    }
+   ],
+   "source": [
+    "# Deduplicate source data to avoid merge conflicts\n",
+    "retailers_df_dedup = retailers_df.dropDuplicates([\"Retailer_code\"])\n",
+    "\n",
+    "# Write to ADLS container\n",
+    "table_path = f\"{bronze_path}/bronze_retailers\"\n",
+    "\n",
+    "if not spark.catalog.tableExists(f\"{schema}.bronze_retailers\"):\n",
+    "    retailers_df_dedup.write \\\n",
+    "        .format(\"delta\") \\\n",
+    "        .mode(\"overwrite\") \\\n",
+    "        .option(\"overwriteSchema\", \"true\") \\\n",
+    "        .option(\"path\", table_path) \\\n",
+    "        .saveAsTable(f\"{schema}.bronze_retailers\")\n",
+    "    print(f\"Table created at: {table_path}\")\n",
+    "else:\n",
+    "    # Merge upsert\n",
+    "    delta_table = DeltaTable.forName(spark, f\"{schema}.bronze_retailers\")\n",
+    "    \n",
+    "    delta_table.alias(\"target\").merge(\n",
+    "        retailers_df_dedup.alias(\"source\"),\n",
+    "        \"target.Retailer_code = source.Retailer_code\"\n",
+    "    ).whenMatchedUpdateAll(\n",
+    "    ).whenNotMatchedInsertAll(\n",
+    "    ).execute()\n",
+    "    \n",
+    "    print(\"Merge upsert completed\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "inputWidgets": {},
+     "nuid": "9bc6ce0b-eeb1-421f-b013-9b6a2886fcf8",
+     "showTitle": true,
+     "tableResultSettingsMap": {},
+     "title": "Sales Section"
+    }
+   },
+   "source": [
+    "## 9. Daily Sales Data Processing\n",
+    "\n",
+    "**Sheet:** Dailysales  \n",
+    "**Expected Records:** 1,030  \n",
+    "**Partitioning:** By sales_year"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "inputWidgets": {},
+     "nuid": "ac7e9bd5-97a4-438f-ba76-ab80af5c70e3",
+     "showTitle": true,
+     "tableResultSettingsMap": {},
+     "title": "Sales Schema"
+    }
+   },
+   "source": [
+    "### Define Daily Sales Schema\n",
+    "\n",
+    "Define the schema for the Daily Sales table."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 0,
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "finishTime": 1782208720890,
+     "inputWidgets": {},
+     "nuid": "bc6b2e36-9cbe-425a-a515-3bbd0e1278bc",
+     "showTitle": true,
+     "startTime": 1782208720733,
+     "submitTime": 1782208720354,
+     "tableResultSettingsMap": {},
+     "title": "Sales Schema"
+    }
+   },
+   "outputs": [],
+   "source": [
+    "dailysales_schema = StructType([\n",
+    "    StructField(\"Retailer_code\", IntegerType(), True),\n",
+    "    StructField(\"Product_number\", IntegerType(), True),\n",
+    "    StructField(\"Order_method_code\", IntegerType(), True),\n",
+    "    StructField(\"Date\", DateType(), True),\n",
+    "    StructField(\"Quantity\", IntegerType(), True),\n",
+    "    StructField(\"Unit_price\", DoubleType(), True),\n",
+    "    StructField(\"Unit_sale_price\", DoubleType(), True)\n",
+    "])"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "inputWidgets": {},
+     "nuid": "f06132f2-0003-458c-aa7c-5489aedb8e7f",
+     "showTitle": true,
+     "tableResultSettingsMap": {},
+     "title": "Load Sales"
+    }
+   },
+   "source": [
+    "### Load Daily Sales Sheet\n",
+    "\n",
+    "Read the Dailysales sheet from Excel, clean column names, and convert to Spark DataFrame."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 0,
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "finishTime": 1782208723292,
+     "inputWidgets": {},
+     "nuid": "bae79007-b454-4380-b42a-ea4de0ff00aa",
+     "showTitle": true,
+     "startTime": 1782208723033,
+     "submitTime": 1782208722430,
+     "tableResultSettingsMap": {},
+     "title": "Load Sales"
+    }
+   },
+   "outputs": [],
+   "source": [
+    "dailysales_pdf = pd.read_excel(excel_file, sheet_name=\"Dailysales\")\n",
+    "dailysales_pdf.columns = [c.replace(\" \", \"_\") for c in dailysales_pdf.columns]\n",
+    "dailysales_df = spark.createDataFrame(dailysales_pdf, schema=dailysales_schema)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "inputWidgets": {},
+     "nuid": "dc04a9d3-e901-4c10-96a9-bf4ed9d22e1b",
+     "showTitle": true,
+     "tableResultSettingsMap": {},
+     "title": "Add Year Column"
+    }
+   },
+   "source": [
+    "### Extract Year from Date\n",
+    "\n",
+    "Add sales_year column for partitioning the bronze_daily_sales table."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 0,
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "finishTime": 1782208725395,
+     "inputWidgets": {},
+     "nuid": "e2b885c5-8bda-4812-b364-7f391328ede7",
+     "showTitle": true,
+     "startTime": 1782208725296,
+     "submitTime": 1782208724835,
+     "tableResultSettingsMap": {},
+     "title": "Add Year Column"
+    }
+   },
+   "outputs": [],
+   "source": [
+    "dailysales_df = dailysales_df.withColumn(\"sales_year\", year(col(\"Date\")))"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "inputWidgets": {},
+     "nuid": "ecc5c680-218f-4b69-ade9-3bbf7eb59e0d",
+     "showTitle": true,
+     "tableResultSettingsMap": {},
+     "title": "Sales Metadata"
+    }
+   },
+   "source": [
+    "### Add Metadata to Sales\n",
+    "\n",
+    "Add ingestion metadata columns to the Daily Sales DataFrame."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 0,
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "finishTime": 1782208727496,
+     "inputWidgets": {},
+     "nuid": "c6caf315-14b7-4034-8dca-a6501388b156",
+     "showTitle": true,
+     "startTime": 1782208727356,
+     "submitTime": 1782208726872,
+     "tableResultSettingsMap": {},
+     "title": "Add Metadata to Sales"
+    }
+   },
+   "outputs": [],
+   "source": [
+    "dailysales_df = add_metadata(dailysales_df, \"Dailysales\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "inputWidgets": {},
+     "nuid": "b225b003-1718-4eed-aa61-79900c5420b9",
+     "showTitle": true,
+     "tableResultSettingsMap": {},
+     "title": "Profile Sales"
+    }
+   },
+   "source": [
+    "### Profile Sales Null Values\n",
+    "\n",
+    "Run null value profiling on Daily Sales DataFrame."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 0,
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "finishTime": 1782208731601,
+     "inputWidgets": {},
+     "nuid": "c469273e-af86-4fff-8fb1-32d2a184c137",
+     "showTitle": true,
+     "startTime": 1782208729608,
+     "submitTime": 1782208729171,
+     "tableResultSettingsMap": {},
+     "title": "Profile Sales"
+    }
+   },
+   "outputs": [
+    {
+     "output_type": "stream",
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "\n===== NULL PROFILE : Daily Sales =====\nRetailer_code: 0\nProduct_number: 0\nOrder_method_code: 0\nDate: 0\nQuantity: 0\nUnit_price: 0\nUnit_sale_price: 0\nsales_year: 0\ningested_at: 0\nsource_file: 0\nprocessing_date: 0\npipeline_version: 0\n"
+     ]
+    }
+   ],
+   "source": [
+    "profile_nulls(dailysales_df, \"Daily Sales\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "inputWidgets": {},
+     "nuid": "4901a5d5-c3df-4610-b69b-dcca0ba2bc87",
+     "showTitle": true,
+     "tableResultSettingsMap": {},
+     "title": "Write Sales"
+    }
+   },
+   "source": [
+    "### Write Sales to Bronze Table\n",
+    "\n",
+    "Deduplicate on composite key (`Retailer_code`, `Product_number`, `Order_method_code`, `Date`), then create or merge-upsert into `bronze_daily_sales` Delta table. Partitioned by `sales_year`."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 0,
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "finishTime": 1782208745117,
+     "inputWidgets": {},
+     "nuid": "bd5d5504-a5a2-46ec-885c-c5f13cea4cfe",
+     "showTitle": true,
+     "startTime": 1782208739717,
+     "submitTime": 1782208739147,
+     "tableResultSettingsMap": {},
+     "title": "Write Sales"
+    }
+   },
+   "outputs": [
+    {
+     "output_type": "stream",
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Table created at: /mnt/gosales/bronze/bronze_daily_sales\n"
+     ]
+    }
+   ],
+   "source": [
+    "# Deduplicate source data to avoid merge conflicts\n",
+    "dailysales_df_dedup = dailysales_df.dropDuplicates([\"Retailer_code\", \"Product_number\", \"Order_method_code\", \"Date\"])\n",
+    "\n",
+    "# Write to ADLS container\n",
+    "table_path = f\"{bronze_path}/bronze_daily_sales\"\n",
+    "\n",
+    "if not spark.catalog.tableExists(f\"{schema}.bronze_daily_sales\"):\n",
+    "    dailysales_df_dedup.write \\\n",
+    "        .format(\"delta\") \\\n",
+    "        .mode(\"overwrite\") \\\n",
+    "        .partitionBy(\"sales_year\") \\\n",
+    "        .option(\"overwriteSchema\", \"true\") \\\n",
+    "        .option(\"path\", table_path) \\\n",
+    "        .saveAsTable(f\"{schema}.bronze_daily_sales\")\n",
+    "    print(f\"Table created at: {table_path}\")\n",
+    "else:\n",
+    "    # Merge upsert with composite key\n",
+    "    delta_table = DeltaTable.forName(spark, f\"{schema}.bronze_daily_sales\")\n",
+    "    \n",
+    "    delta_table.alias(\"target\").merge(\n",
+    "        dailysales_df_dedup.alias(\"source\"),\n",
+    "        \"\"\"target.Retailer_code = source.Retailer_code AND \n",
+    "           target.Product_number = source.Product_number AND \n",
+    "           target.Order_method_code = source.Order_method_code AND \n",
+    "           target.Date = source.Date\"\"\"\n",
+    "    ).whenMatchedUpdateAll(\n",
+    "    ).whenNotMatchedInsertAll(\n",
+    "    ).execute()\n",
+    "    \n",
+    "    print(\"Merge upsert completed\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "inputWidgets": {},
+     "nuid": "f3ca0c4f-a344-4cb9-9d47-41676624dade",
+     "showTitle": true,
+     "tableResultSettingsMap": {},
+     "title": "Validation"
+    }
+   },
+   "source": [
+    "## 10. Validation\n",
+    "\n",
+    "Verify that all bronze tables were created successfully with expected record counts."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 0,
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "finishTime": 1782208749321,
+     "inputWidgets": {},
+     "nuid": "8d493e5e-30e0-495e-9120-9c20eaeac404",
+     "showTitle": true,
+     "startTime": 1782208747136,
+     "submitTime": 1782208746604,
+     "tableResultSettingsMap": {},
+     "title": "Validation"
+    }
+   },
+   "outputs": [
+    {
+     "output_type": "stream",
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "===== BRONZE LAYER VALIDATION =====\nProducts: 270 (expected: 282)\nOrder Methods: 12 (expected: 12)\nRetailers: 553 (expected: 578)\nDaily Sales: 977 (expected: 1,030)\n"
+     ]
+    }
+   ],
+   "source": [
+    "print(\"===== BRONZE LAYER VALIDATION =====\")\n",
+    "products_count = spark.table(f\"{schema}.bronze_products\").count()\n",
+    "methods_count = spark.table(f\"{schema}.bronze_order_methods\").count()\n",
+    "retailers_count = spark.table(f\"{schema}.bronze_retailers\").count()\n",
+    "sales_count = spark.table(f\"{schema}.bronze_daily_sales\").count()\n",
+    "print(f\"Products: {products_count} (expected: 282)\")\n",
+    "print(f\"Order Methods: {methods_count} (expected: 12)\")\n",
+    "print(f\"Retailers: {retailers_count} (expected: 578)\")\n",
+    "print(f\"Daily Sales: {sales_count} (expected: 1,030)\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "inputWidgets": {},
+     "nuid": "1e8a361d-cebf-4fe7-9979-ed9c4f50eed1",
+     "showTitle": true,
+     "tableResultSettingsMap": {},
+     "title": "Summary"
+    }
+   },
+   "source": [
+    "## 11. Pipeline Summary\n",
+    "\n",
+    "**Bronze Layer Ingestion Complete**\n",
+    "\n",
+    "**Source:** ADLS Gen2 → `datalakedegroup3/gosales/raw/Gosales_Dirty_AllSheets.xlsx`  \n",
+    "**Mount Point:** `/mnt/gosales`\n",
+    "\n",
+    "All four bronze tables have been successfully created:\n",
+    "* `bronze_products` — Product catalog (282 records)\n",
+    "* `bronze_order_methods` — Order method types (12 records)\n",
+    "* `bronze_retailers` — Retailer information (578 records)\n",
+    "* `bronze_daily_sales` — Daily sales transactions (1,030 records, partitioned by sales_year)\n",
+    "\n",
+    "Each table includes metadata columns (`ingested_at`, `source_file`, `processing_date`, `pipeline_version`) for data lineage tracking."
+   ]
+  }
+ ],
+ "metadata": {
+  "application/vnd.databricks.v1+notebook": {
+   "computePreferences": null,
+   "dashboards": [],
+   "environmentMetadata": {
+    "base_environment": "",
+    "environment_version": "5"
+   },
+   "inputWidgetPreferences": null,
+   "language": "python",
+   "notebookMetadata": {
+    "pythonIndentUnit": 4
+   },
+   "notebookName": "GoSales_Bronze_Final (1)",
+   "widgets": {
+    "schema": {
+     "currentValue": "default",
+     "nuid": "a1e00b94-8ccc-4d32-897e-c8f3e5a1c176",
+     "typedWidgetInfo": {
+      "autoCreated": false,
+      "defaultValue": "default",
+      "label": null,
+      "name": "schema",
+      "options": {
+       "widgetDisplayType": "Text",
+       "validationRegex": null
+      },
+      "parameterDataType": "String",
+      "dynamic": false
+     },
+     "widgetInfo": {
+      "widgetType": "text",
+      "defaultValue": "default",
+      "label": null,
+      "name": "schema",
+      "options": {
+       "widgetType": "text",
+       "autoCreated": null,
+       "validationRegex": null
+      }
+     }
+    },
+    "source_path": {
+     "currentValue": "/mnt/gosales",
+     "nuid": "94158222-2c1a-4a16-86d1-a538729f456b",
+     "typedWidgetInfo": {
+      "autoCreated": false,
+      "defaultValue": "/mnt/gosales",
+      "label": null,
+      "name": "source_path",
+      "options": {
+       "widgetDisplayType": "Text",
+       "validationRegex": null
+      },
+      "parameterDataType": "String",
+      "dynamic": false
+     },
+     "widgetInfo": {
+      "widgetType": "text",
+      "defaultValue": "/mnt/gosales",
+      "label": null,
+      "name": "source_path",
+      "options": {
+       "widgetType": "text",
+       "autoCreated": null,
+       "validationRegex": null
+      }
+     }
+    }
+   }
+  },
+  "language_info": {
+   "name": "python"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 0
+}
